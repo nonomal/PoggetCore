@@ -133,10 +133,18 @@ namespace PoggetMeta {
         std::unordered_set<std::wstring> sources;
         std::unordered_set<std::wstring> destinations;
         std::vector<std::filesystem::path> transferSources;
+        std::vector<PoggetCore::HistoryFileSystem::DestructiveRequest> destructiveRequests;
 
         for (const auto& task : prepared) {
             const bool isTransfer = task.opType == MetaOpType::Copy ||
-                task.opType == MetaOpType::Move || task.opType == MetaOpType::Rename;
+                task.opType == MetaOpType::Move || task.opType == MetaOpType::Rename ||
+                task.opType == MetaOpType::RecycleWithUndoBackup;
+            const bool isDestructive = task.opType == MetaOpType::Delete ||
+                task.opType == MetaOpType::Recycle ||
+                task.opType == MetaOpType::RecycleWithUndoBackup;
+            if (isDestructive) {
+                destructiveRequests.push_back({ task.src, task.requiredSourceParent });
+            }
             if (!isTransfer) continue;
             if (task.src.empty() || task.dest.empty()) {
                 batchFailure = L"batch contains an empty transfer path";
@@ -157,6 +165,12 @@ namespace PoggetMeta {
             transferSources.emplace_back(task.src);
         }
 
+        if (batchFailure.empty() && !destructiveRequests.empty()) {
+            const auto validation =
+                PoggetCore::HistoryFileSystem::ValidateDestructiveBatch(destructiveRequests);
+            if (!validation) batchFailure = validation.context;
+        }
+
         if (batchFailure.empty()) {
             for (size_t left = 0; left < transferSources.size() && batchFailure.empty(); ++left) {
                 for (size_t right = left + 1; right < transferSources.size(); ++right) {
@@ -174,7 +188,8 @@ namespace PoggetMeta {
         if (batchFailure.empty()) {
             for (const auto& task : prepared) {
                 const bool isTransfer = task.opType == MetaOpType::Copy ||
-                    task.opType == MetaOpType::Move || task.opType == MetaOpType::Rename;
+                    task.opType == MetaOpType::Move || task.opType == MetaOpType::Rename ||
+                    task.opType == MetaOpType::RecycleWithUndoBackup;
                 if (!isTransfer) continue;
                 const auto sourceKey = PoggetCore::HistoryFileSystem::ComparablePath(task.src);
                 const auto destinationKey = PoggetCore::HistoryFileSystem::ComparablePath(task.dest);
@@ -246,96 +261,139 @@ namespace PoggetMeta {
 
             std::error_code ec;
             bool success = false;
+            bool retryRequested = false;
+            do {
+                success = false;
+                retryRequested = false;
+                task.failureReason.clear();
+                task.failureError.clear();
 
-            try {
-                if (!task.preflightError.empty()) {
-                    if (taskListener) taskListener->OnLog(L"ERROR", task.preflightError);
-                    success = false;
-                }
-                else if (cancelled) {
-                    success = false;
-                }
-                else {
-                std::filesystem::path replacedBackup;
-                if (task.batchCollisionChoice == 1 &&
-                    !task.dest.empty() &&
-                    PoggetCore::HistoryFileSystem::ComparablePath(task.src) !=
-                        PoggetCore::HistoryFileSystem::ComparablePath(task.dest) &&
-                    PoggetCore::HistoryFileSystem::Exists(task.dest)) {
-                    std::filesystem::path backupRoot = task.historyBackupRoot;
-                    if (backupRoot.empty()) {
-                        backupRoot = std::filesystem::temp_directory_path(ec) / L"PoggetUndo";
-                    }
-                    auto backupResult = PoggetCore::HistoryFileSystem::BackupDestination(
-                        task.dest, backupRoot, replacedBackup);
-                    if (!backupResult) {
-                        throw std::filesystem::filesystem_error(
-                            "Unable to back up overwritten destination",
-                            task.dest,
-                            backupResult.error);
-                    }
-                    task.replacedBackupPath = replacedBackup.wstring();
-                }
-
-                // Execute cross-platform file operation
-                if (task.opType == MetaOpType::Move) {
-                    auto result = PoggetCore::HistoryFileSystem::MovePath(
-                        task.src, task.dest, task.verifyContent);
+                auto acceptResult = [&](const PoggetCore::HistoryFileSystem::Result& result) {
                     success = static_cast<bool>(result);
-                    if (success && !result.context.empty() && taskListener) {
-                        taskListener->OnLog(L"WARNING", result.context);
+                    if (success) {
+                        if (!result.context.empty() && taskListener)
+                            taskListener->OnLog(L"WARNING", result.context);
+                        return;
                     }
-            } else if (task.opType == MetaOpType::Copy) {
-                SetCopyProgress(0.5f);
-                auto result = PoggetCore::HistoryFileSystem::CopyPath(
-                    task.src, task.dest, task.verifyContent);
-                success = static_cast<bool>(result);
-            } else if (task.opType == MetaOpType::Rename) {
-                auto result = PoggetCore::HistoryFileSystem::MovePath(
-                    task.src, task.dest, task.verifyContent);
-                success = static_cast<bool>(result);
-                if (success && !result.context.empty() && taskListener) {
-                    taskListener->OnLog(L"WARNING", result.context);
-                }
-            } else if (task.opType == MetaOpType::Delete) {
-                auto result = PoggetCore::HistoryFileSystem::RemovePath(task.src);
-                success = static_cast<bool>(result);
-            } else if (task.opType == MetaOpType::Recycle) {
-#ifdef _WIN32
-                std::wstring doubleNullStr = task.src;
-                doubleNullStr.push_back(L'\0');
-                doubleNullStr.push_back(L'\0');
-                SHFILEOPSTRUCTW fileOp = {0};
-                fileOp.wFunc = FO_DELETE;
-                fileOp.pFrom = doubleNullStr.c_str();
-                fileOp.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI;
-                int res = SHFileOperationW(&fileOp);
-                success = (res == 0 && !fileOp.fAnyOperationsAborted &&
-                    !PoggetCore::HistoryFileSystem::Exists(task.src));
-#else
-                auto result = PoggetCore::HistoryFileSystem::RemovePath(task.src);
-                success = static_cast<bool>(result);
-#endif
-            }
+                    task.failureReason = result.context.empty()
+                        ? L"file-system operation failed" : result.context;
+                    task.failureError = result.error;
+                    if (result.error) {
+                        const auto message = result.error.message();
+                        if (!message.empty()) {
+                            task.failureReason += L" (" +
+                                std::wstring(message.begin(), message.end()) + L")";
+                        }
+                    }
+                };
 
-                if (!success && !task.replacedBackupPath.empty() &&
-                    PoggetCore::HistoryFileSystem::Exists(task.replacedBackupPath)) {
+                try {
+                    if (!task.preflightError.empty()) {
+                        task.failureReason = task.preflightError;
+                        if (taskListener) taskListener->OnLog(L"ERROR", task.preflightError);
+                    }
+                    else if (cancelled) {
+                        task.failureReason = L"operation was cancelled";
+                    }
+                    else {
+                        const bool isDestructive = task.opType == MetaOpType::Delete ||
+                            task.opType == MetaOpType::Recycle ||
+                            task.opType == MetaOpType::RecycleWithUndoBackup;
+                        if (isDestructive) {
+                            const auto validation =
+                                PoggetCore::HistoryFileSystem::ValidateDestructiveBatch(
+                                    { { task.src, task.requiredSourceParent } });
+                            if (!validation) {
+                                task.failureReason = validation.context;
+                                if (taskListener)
+                                    taskListener->OnLog(L"ERROR", validation.context);
+                            }
+                        }
+
+                        if (task.failureReason.empty() && task.batchCollisionChoice == 1 &&
+                            !task.dest.empty() &&
+                            PoggetCore::HistoryFileSystem::ComparablePath(task.src) !=
+                                PoggetCore::HistoryFileSystem::ComparablePath(task.dest) &&
+                            PoggetCore::HistoryFileSystem::Exists(task.dest)) {
+                            std::filesystem::path backupRoot = task.historyBackupRoot;
+                            if (backupRoot.empty()) {
+                                backupRoot = std::filesystem::temp_directory_path(ec) / L"PoggetUndo";
+                            }
+                            std::filesystem::path replacedBackup;
+                            const auto backupResult =
+                                PoggetCore::HistoryFileSystem::BackupDestination(
+                                    task.dest, backupRoot, replacedBackup);
+                            if (!backupResult) {
+                                acceptResult(backupResult);
+                            }
+                            else {
+                                task.replacedBackupPath = replacedBackup.wstring();
+                            }
+                        }
+
+                        if (task.failureReason.empty()) {
+                            if (task.opType == MetaOpType::Move) {
+                                acceptResult(PoggetCore::HistoryFileSystem::MovePath(
+                                    task.src, task.dest, task.verifyContent));
+                            }
+                            else if (task.opType == MetaOpType::Copy) {
+                                SetCopyProgress(0.5f);
+                                acceptResult(PoggetCore::HistoryFileSystem::CopyPath(
+                                    task.src, task.dest, task.verifyContent));
+                            }
+                            else if (task.opType == MetaOpType::Rename) {
+                                acceptResult(PoggetCore::HistoryFileSystem::MovePath(
+                                    task.src, task.dest, task.verifyContent));
+                            }
+                            else if (task.opType == MetaOpType::Delete) {
+                                acceptResult(PoggetCore::HistoryFileSystem::RemovePath(task.src));
+                            }
+                            else if (task.opType == MetaOpType::Recycle) {
+                                acceptResult(PoggetCore::HistoryFileSystem::RecyclePath(task.src));
+                            }
+                            else if (task.opType == MetaOpType::RecycleWithUndoBackup) {
+                                acceptResult(
+                                    PoggetCore::HistoryFileSystem::RecyclePathWithUndoBackup(
+                                        task.src, task.dest, task.verifyContent));
+                            }
+                        }
+
+                        if (!success && !task.replacedBackupPath.empty() &&
+                            PoggetCore::HistoryFileSystem::Exists(task.replacedBackupPath)) {
+                            if (!RestoreReplacedDestinationWithoutDataLoss(task, taskListener)) {
+                                task.failureReason +=
+                                    L"; automatic rollback needs attention before retrying";
+                            }
+                        }
+                    }
+                }
+                catch (const std::exception& e) {
                     RestoreReplacedDestinationWithoutDataLoss(task, taskListener);
+                    const std::string message = e.what();
+                    task.failureReason = L"Exception during async file task: " +
+                        std::wstring(message.begin(), message.end());
+                    if (taskListener) taskListener->OnLog(L"ERROR", task.failureReason);
+                    success = false;
                 }
+                catch (...) {
+                    RestoreReplacedDestinationWithoutDataLoss(task, taskListener);
+                    task.failureReason = L"Unknown exception during async file task";
+                    if (taskListener) taskListener->OnLog(L"ERROR", task.failureReason);
+                    success = false;
                 }
 
-                        } catch (const std::exception& e) {
-                RestoreReplacedDestinationWithoutDataLoss(task, taskListener);
-                if (taskListener) {
-                    std::string msg = e.what();
-                    taskListener->OnLog(L"ERROR", L"Exception during async file task: " + std::wstring(msg.begin(), msg.end()));
+                const bool retryIsSafe = task.replacedBackupPath.empty();
+                if (!success && !cancelled && retryIsSafe && task.requestRetry) {
+                    try {
+                        retryRequested = task.requestRetry(task.failureReason, task.failureError);
+                    }
+                    catch (...) {
+                        retryRequested = false;
+                        if (taskListener)
+                            taskListener->OnLog(L"ERROR", L"Retry decision callback failed");
+                    }
                 }
-                success = false;
-            } catch (...) {
-                RestoreReplacedDestinationWithoutDataLoss(task, taskListener);
-                if (taskListener) taskListener->OnLog(L"ERROR", L"Unknown exception during async file task.");
-                success = false;
-            }
+            } while (retryRequested);
 
             if (success) {
                 auto successCallback = [taskListener, task]() {
