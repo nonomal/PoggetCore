@@ -11,6 +11,19 @@
 
 namespace PoggetCore {
 
+    struct PagedLayoutModeConfig {
+        // 0: horizontal pages, 1: vertical pages, 2: continuous vertical layout.
+        int FlowMode = 0;
+        int MaxColumns = 4;
+        int MaxRows = 4;
+    };
+
+    struct PagedLayoutConfig {
+        bool HasStoredSettings = false;
+        PagedLayoutModeConfig Fixed;
+        PagedLayoutModeConfig Dynamic;
+    };
+
     struct CoreFileOp {
         int type = 0; // 0: physical create/copy, 1: delete, 2: rename, 3-5: virtual, 6: move, 7: virtual path
         std::wstring path1;
@@ -59,6 +72,7 @@ namespace PoggetCore {
         int HideFileExtension = 0; // 0,1,2
         int IconSpacingMode = 0;
         int IconSpacingType = 0;
+        PagedLayoutConfig PagedLayout;
         bool IsListView = false;
         int TextRenderMode = 0;
         int FileNameColorMode = 0;

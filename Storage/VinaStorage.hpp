@@ -387,17 +387,49 @@ public:
         filename_ = filename;
         loaded_ = false;
 
+        const std::wstring backup_filename =
+            backup_path_.empty() ? (filename + L".bak") : backup_path_;
+
         // Check if primary file exists
 #ifdef _WIN32
         DWORD dwAttrs = GetFileAttributesW(filename.c_str());
         bool file_exists = (dwAttrs != INVALID_FILE_ATTRIBUTES && !(dwAttrs & FILE_ATTRIBUTE_DIRECTORY));
+        DWORD dwBackupAttrs = GetFileAttributesW(backup_filename.c_str());
+        bool backup_exists =
+            (dwBackupAttrs != INVALID_FILE_ATTRIBUTES && !(dwBackupAttrs & FILE_ATTRIBUTE_DIRECTORY));
 #else
         std::wifstream file_check(filename);
         bool file_exists = file_check.good();
         file_check.close();
+        std::wifstream backup_check(backup_filename);
+        bool backup_exists = backup_check.good();
+        backup_check.close();
 #endif
 
         if (!file_exists) {
+            if (backup_exists && LoadInternal(backup_filename)) {
+                loaded_ = true;
+                std::wcout << L"VinaStorage primary file was missing; loaded backup '"
+                    << backup_filename << L"'." << std::endl;
+#ifdef _WIN32
+                static std::atomic<unsigned long long> missing_restore_sequence{ 0 };
+                const std::wstring restore_temp = filename + L".restore." +
+                    std::to_wstring(GetCurrentProcessId()) + L"." +
+                    std::to_wstring(GetTickCount64()) + L"." +
+                    std::to_wstring(++missing_restore_sequence);
+                if (CopyFileW(backup_filename.c_str(), restore_temp.c_str(), TRUE)) {
+                    if (!MoveFileExW(restore_temp.c_str(), filename.c_str(),
+                            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+                        DeleteFileW(restore_temp.c_str());
+                    }
+                }
+#else
+                std::ifstream src(backup_filename, std::ios::binary);
+                std::ofstream dst(filename, std::ios::binary | std::ios::trunc);
+                dst << src.rdbuf();
+#endif
+                return;
+            }
             std::wcout << L"Info: File '" << filename << L"' does not exist. Creating new storage." << std::endl;
             root_objects_.clear();
             loaded_ = true;
@@ -412,16 +444,6 @@ public:
         }
 
         // If primary file failed to load, try backup file
-        std::wstring backup_filename = backup_path_.empty() ? (filename + L".bak") : backup_path_;
-#ifdef _WIN32
-        DWORD dwBackupAttrs = GetFileAttributesW(backup_filename.c_str());
-        bool backup_exists = (dwBackupAttrs != INVALID_FILE_ATTRIBUTES && !(dwBackupAttrs & FILE_ATTRIBUTE_DIRECTORY));
-#else
-        std::wifstream backup_check(backup_filename);
-        bool backup_exists = backup_check.good();
-        backup_check.close();
-#endif
-
         if (backup_exists) {
             std::wcerr << L"Warning: Failed to load primary file '" << filename << L"'. Attempting to restore from backup '" << backup_filename << L"'." << std::endl;
             if (LoadInternal(backup_filename)) {

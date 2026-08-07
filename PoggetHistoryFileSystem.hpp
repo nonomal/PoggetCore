@@ -121,6 +121,26 @@ namespace PoggetCore::HistoryFileSystem {
         return normalized;
     }
 
+    inline std::filesystem::path FileSystemAccessPath(
+        const std::filesystem::path& path) {
+#ifdef _WIN32
+        if (path.empty()) return path;
+        const auto original = path.wstring();
+        if (original.starts_with(L"\\\\?\\")) return path;
+        std::error_code ec;
+        auto value = std::filesystem::absolute(path, ec).lexically_normal().wstring();
+        if (ec) value = path.lexically_normal().wstring();
+        const std::filesystem::path normalized(value);
+        if (normalized == normalized.root_path()) return normalized;
+        if (value.starts_with(L"\\\\")) {
+            return std::filesystem::path(L"\\\\?\\UNC\\" + value.substr(2));
+        }
+        return std::filesystem::path(L"\\\\?\\" + value);
+#else
+        return path;
+#endif
+    }
+
     inline PathInspection InspectPath(const std::filesystem::path& path) noexcept {
         if (path.empty()) {
             return { PathPresence::Missing, {},
@@ -128,7 +148,8 @@ namespace PoggetCore::HistoryFileSystem {
         }
 
         std::error_code ec;
-        const auto status = std::filesystem::symlink_status(path, ec);
+        const auto status = std::filesystem::symlink_status(
+            FileSystemAccessPath(path), ec);
         if (!ec) {
             return {
                 status.type() == std::filesystem::file_type::not_found
@@ -147,6 +168,34 @@ namespace PoggetCore::HistoryFileSystem {
 
     inline bool Exists(const std::filesystem::path& path) noexcept {
         return InspectPath(path).presence == PathPresence::Present;
+    }
+
+    inline Result EnsureDirectoryExists(const std::filesystem::path& path) noexcept {
+        if (path.empty()) {
+            return { false, std::make_error_code(std::errc::invalid_argument),
+                L"empty directory path" };
+        }
+
+        const auto inspection = InspectPath(path);
+        if (inspection.presence == PathPresence::Inaccessible) {
+            return { false, inspection.error, L"checking directory" };
+        }
+        if (inspection.presence == PathPresence::Present) {
+            std::error_code ec;
+            const bool isDirectory = std::filesystem::is_directory(
+                FileSystemAccessPath(path), ec);
+            if (ec) return { false, ec, L"checking directory type" };
+            if (!isDirectory) {
+                return { false, std::make_error_code(std::errc::not_a_directory),
+                    L"path exists but is not a directory" };
+            }
+            return { true, {}, L"" };
+        }
+
+        std::error_code ec;
+        std::filesystem::create_directories(FileSystemAccessPath(path), ec);
+        if (ec) return { false, ec, L"creating directory" };
+        return { true, {}, L"" };
     }
 
     inline bool IsPathInside(
@@ -271,14 +320,16 @@ namespace PoggetCore::HistoryFileSystem {
         const std::filesystem::path& right,
         bool verifyContent = false) {
         std::error_code ec;
-        const auto leftSize = std::filesystem::file_size(left, ec);
+        const auto leftAccess = FileSystemAccessPath(left);
+        const auto rightAccess = FileSystemAccessPath(right);
+        const auto leftSize = std::filesystem::file_size(leftAccess, ec);
         if (ec) return false;
-        const auto rightSize = std::filesystem::file_size(right, ec);
+        const auto rightSize = std::filesystem::file_size(rightAccess, ec);
         if (ec || leftSize != rightSize) return false;
         if (!verifyContent) return true;
 
-        std::ifstream leftStream(left, std::ios::binary);
-        std::ifstream rightStream(right, std::ios::binary);
+        std::ifstream leftStream(leftAccess, std::ios::binary);
+        std::ifstream rightStream(rightAccess, std::ios::binary);
         if (!leftStream.is_open() || !rightStream.is_open()) return false;
 
         std::vector<char> leftBuffer(1024 * 1024);
@@ -332,18 +383,20 @@ namespace PoggetCore::HistoryFileSystem {
         const std::filesystem::path& right,
         bool verifyContent = false) {
         std::error_code ec;
-        const auto leftStatus = std::filesystem::symlink_status(left, ec);
+        const auto leftAccess = FileSystemAccessPath(left);
+        const auto rightAccess = FileSystemAccessPath(right);
+        const auto leftStatus = std::filesystem::symlink_status(leftAccess, ec);
         if (ec) return false;
-        const auto rightStatus = std::filesystem::symlink_status(right, ec);
+        const auto rightStatus = std::filesystem::symlink_status(rightAccess, ec);
         if (ec || leftStatus.type() != rightStatus.type()) return false;
 
         if (std::filesystem::is_regular_file(leftStatus)) {
             return EquivalentFileContents(left, right, verifyContent);
         }
         if (std::filesystem::is_symlink(leftStatus)) {
-            const auto leftTarget = std::filesystem::read_symlink(left, ec);
+            const auto leftTarget = std::filesystem::read_symlink(leftAccess, ec);
             if (ec) return false;
-            const auto rightTarget = std::filesystem::read_symlink(right, ec);
+            const auto rightTarget = std::filesystem::read_symlink(rightAccess, ec);
             return !ec && leftTarget == rightTarget;
         }
         return std::filesystem::is_directory(leftStatus);
@@ -353,24 +406,26 @@ namespace PoggetCore::HistoryFileSystem {
         const std::filesystem::path& left,
         const std::filesystem::path& right,
         bool verifyContent = false) {
-        if (!EquivalentSingleEntry(left, right, verifyContent)) return false;
+        const auto leftAccess = FileSystemAccessPath(left);
+        const auto rightAccess = FileSystemAccessPath(right);
+        if (!EquivalentSingleEntry(leftAccess, rightAccess, verifyContent)) return false;
 
         std::error_code ec;
-        const auto leftStatus = std::filesystem::symlink_status(left, ec);
+        const auto leftStatus = std::filesystem::symlink_status(leftAccess, ec);
         if (ec || !std::filesystem::is_directory(leftStatus)) return !ec;
 
         size_t leftCount = 0;
-        for (std::filesystem::recursive_directory_iterator it(left, ec), end;
+        for (std::filesystem::recursive_directory_iterator it(leftAccess, ec), end;
             !ec && it != end; it.increment(ec)) {
             ++leftCount;
-            const auto relative = it->path().lexically_relative(left);
+            const auto relative = it->path().lexically_relative(leftAccess);
             if (relative.empty() ||
-                !EquivalentSingleEntry(it->path(), right / relative, verifyContent)) return false;
+                !EquivalentSingleEntry(it->path(), rightAccess / relative, verifyContent)) return false;
         }
         if (ec) return false;
 
         size_t rightCount = 0;
-        for (std::filesystem::recursive_directory_iterator it(right, ec), end;
+        for (std::filesystem::recursive_directory_iterator it(rightAccess, ec), end;
             !ec && it != end; it.increment(ec)) {
             ++rightCount;
         }
@@ -418,9 +473,7 @@ namespace PoggetCore::HistoryFileSystem {
         bool preserveExtension = false) {
         if (root.empty()) return {};
 
-        std::error_code ec;
-        std::filesystem::create_directories(root, ec);
-        if (ec) return {};
+        if (!EnsureDirectoryExists(root)) return {};
 
         static std::atomic<unsigned long long> sequence{ 0 };
         const auto ticks = static_cast<unsigned long long>(
@@ -476,10 +529,10 @@ namespace PoggetCore::HistoryFileSystem {
         }
         ec.clear();
         if (std::filesystem::is_directory(inspection.status)) {
-            std::filesystem::remove_all(absolutePath, ec);
+            std::filesystem::remove_all(FileSystemAccessPath(absolutePath), ec);
         }
         else {
-            std::filesystem::remove(absolutePath, ec);
+            std::filesystem::remove(FileSystemAccessPath(absolutePath), ec);
         }
         return AuditedResult(FileOperationType::Delete, absolutePath, deletedDestination,
             { !ec, ec, ec ? L"removing path" : L"" });
@@ -596,37 +649,45 @@ namespace PoggetCore::HistoryFileSystem {
         std::filesystem::path& staging,
         bool verifyContent = false) {
         staging.clear();
-        std::error_code ec;
         const auto parent = destination.parent_path();
         if (!parent.empty()) {
-            std::filesystem::create_directories(parent, ec);
-            if (ec) return { false, ec, L"creating destination parent" };
+            auto parentResult = EnsureDirectoryExists(parent);
+            if (!parentResult) {
+                parentResult.context = L"creating destination parent: " + parentResult.context;
+                return parentResult;
+            }
         }
 
         auto stagingRoot = parent;
+        std::error_code ec;
         if (stagingRoot.empty()) {
             stagingRoot = std::filesystem::current_path(ec);
             if (ec) return { false, ec, L"resolving staging directory" };
         }
         staging = MakeUniquePath(stagingRoot, destination, L"staging");
-        if (staging.empty()) return { false, {}, L"creating staging path" };
+        if (staging.empty()) {
+            return { false, {}, L"creating staging path in: " + stagingRoot.wstring() };
+        }
+        const auto stagingPathForDiagnostics = staging;
 
-        const auto sourceStatus = std::filesystem::symlink_status(source, ec);
+        const auto sourceAccess = FileSystemAccessPath(source);
+        const auto stagingAccess = FileSystemAccessPath(staging);
+        const auto sourceStatus = std::filesystem::symlink_status(sourceAccess, ec);
         if (ec) return { false, ec, L"reading source status" };
 
         if (std::filesystem::is_symlink(sourceStatus)) {
-            std::filesystem::copy_symlink(source, staging, ec);
+            std::filesystem::copy_symlink(sourceAccess, stagingAccess, ec);
         }
         else if (std::filesystem::is_directory(sourceStatus)) {
             std::filesystem::copy(
-                source,
-                staging,
+                sourceAccess,
+                stagingAccess,
                 std::filesystem::copy_options::recursive |
                     std::filesystem::copy_options::copy_symlinks,
                 ec);
         }
         else if (std::filesystem::is_regular_file(sourceStatus)) {
-            std::filesystem::copy_file(source, staging, ec);
+            std::filesystem::copy_file(sourceAccess, stagingAccess, ec);
         }
         else {
             return { false, std::make_error_code(std::errc::operation_not_supported),
@@ -635,13 +696,13 @@ namespace PoggetCore::HistoryFileSystem {
         if (ec) {
             RemovePath(staging);
             staging.clear();
-            return { false, ec, L"copying to staging path" };
+            return { false, ec, L"copying to staging path: " + stagingPathForDiagnostics.wstring() };
         }
-        if (!EquivalentPathContents(source, staging, verifyContent)) {
+        if (!EquivalentPathContents(sourceAccess, stagingAccess, verifyContent)) {
             RemovePath(staging);
             staging.clear();
             return { false, std::make_error_code(std::errc::io_error),
-                L"verifying staged copy" };
+                L"verifying staged copy at: " + stagingPathForDiagnostics.wstring() };
         }
         return { true, {}, L"" };
     }
@@ -689,7 +750,8 @@ namespace PoggetCore::HistoryFileSystem {
         }
 
         std::error_code ec;
-        std::filesystem::rename(staging, destination, ec);
+        std::filesystem::rename(FileSystemAccessPath(staging),
+            FileSystemAccessPath(destination), ec);
         if (ec) {
             RemovePath(staging);
             return AuditedResult(FileOperationType::Copy, source, destination,
@@ -799,17 +861,19 @@ namespace PoggetCore::HistoryFileSystem {
                 { false, {}, L"destination already exists" });
         }
 
-        std::error_code ec;
         const auto parent = destination.parent_path();
         if (!parent.empty()) {
-            std::filesystem::create_directories(parent, ec);
-            if (ec) {
+            auto parentResult = EnsureDirectoryExists(parent);
+            if (!parentResult) {
                 return AuditedResult(operation, source, destination,
-                    { false, ec, L"creating destination parent" });
+                    { false, parentResult.error,
+                        L"creating destination parent: " + parentResult.context });
             }
         }
 
-        std::filesystem::rename(source, destination, ec);
+        std::error_code ec;
+        std::filesystem::rename(FileSystemAccessPath(source),
+            FileSystemAccessPath(destination), ec);
         if (!ec) {
             return AuditedResult(operation, source, destination,
                 { true, {}, L"" });

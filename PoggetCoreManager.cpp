@@ -8,6 +8,7 @@ namespace PoggetCore {
         std::vector<CoreSectionHeaderLayoutData>& outHeaders,
         void* containerWin,
         int containerWidth,
+        int containerHeight,
         int startX,
         int startY,
         int iconSize,
@@ -15,9 +16,13 @@ namespace PoggetCore {
         bool isSearchManager,
         bool isInlineManager,
         const std::function<CoreContainerConfig(void*)>& getConfig,
-        const std::function<bool(void*, const std::wstring&)>& isSectionCollapsedInSearch
+        const std::function<bool(void*, const std::wstring&)>& isSectionCollapsedInSearch,
+        const std::vector<CoreSectionLayoutInput>* sectionInputs,
+        const CoreLayoutAnchor* layoutAnchor,
+        CoreLayoutResult* outResult
     ) {
-        if (icons.empty()) return;
+        CoreLayoutResult layoutResult;
+        if (outResult) *outResult = layoutResult;
 
         CoreContainerConfig mainData = getConfig(containerWin);
         bool needsSort = false;
@@ -105,12 +110,25 @@ namespace PoggetCore {
             }
         }
 
-        int spacingMode = mainData.IconSpacingMode;
+        const bool customLayout = mainData.EnablePagedLayout &&
+            (!mainData.IsIntegrated || mainData.IsMergedHost) &&
+            !mainData.IsListView &&
+            !mainData.IsSearchMode && !mainData.IsInInlineFolderView &&
+            !isSearchManager && !isInlineManager;
+        const int customFlowMode = std::clamp(mainData.PagedLayoutFlowMode, 0, 2);
+        const bool pagedLayout = customLayout && customFlowMode != 2;
+        const bool horizontalPages = customFlowMode == 0;
+        layoutResult.isCustomLayout = customLayout;
+        layoutResult.flowMode = customFlowMode;
+        int spacingMode = mainData.IconSpacingMode == 3 ? 1 : mainData.IconSpacingMode;
         int actualStartX = startX;
         if (mainData.IconSpacingType == 1) {
             actualStartX = (spacingMode == 0) ? 16 : ((spacingMode == 1) ? 24 : 32);
         }
         int availableWidth = (std::max)(0, containerWidth - 2 * actualStartX);
+        if (pagedLayout && !horizontalPages) {
+            availableWidth = (std::max)(0, availableWidth - 18);
+        }
         bool isList = mainData.IsListView;
 
         int gapX = gap + (spacingMode == 1 ? 16 : (spacingMode == 2 ? 36 : 0));
@@ -121,12 +139,22 @@ namespace PoggetCore {
         // 文本预览横跨两个标准图标单元；宽度必须包含两个单元之间的动态间隔，
         // 才能保证它左右两侧与普通图标保持相同留白。
         const int textWidgetWidth = iconSize * 2 + gapX;
+        const int layoutTextWidgetWidth = customLayout
+            ? (std::min)(textWidgetWidth, (std::max)(1, availableWidth))
+            : textWidgetWidth;
         int gapY = gap + 15 + (spacingMode == 1 ? 20 : (spacingMode == 2 ? 45 : 0));
         int baseListStepY = (iconSize / 2) + 8;
         int listStepY = baseListStepY + (spacingMode == 1 ? 12 : (spacingMode == 2 ? 28 : 0));
 
         int iconsPerRow = isList ? 1 : (availableWidth / (iconSize + gapX));
         if (iconsPerRow <= 0) iconsPerRow = 1;
+        if (customLayout) {
+            iconsPerRow = (std::min)(iconsPerRow,
+                (std::max)(1, mainData.PagedLayoutMaxColumns));
+        }
+        const auto getItemSpan = [iconsPerRow](bool isTextWidget) -> int {
+            return isTextWidget ? (std::min)(2, iconsPerRow) : 1;
+        };
 
         if (mainData.IconSpacingType == 1 && !isList) {
             if (iconsPerRow > 1) {
@@ -256,15 +284,18 @@ namespace PoggetCore {
                 std::vector<size_t> testIndices = currentTempRow.iconIndices;
                 testIndices.push_back(i);
                 int testNumItems = static_cast<int>(testIndices.size());
+                int testSpan = 0;
                 int minRequiredWidth = 0;
                 for (size_t idx : testIndices) {
                     void* tWin = icons[idx].originWindow ? icons[idx].originWindow : containerWin;
                     bool isTxt = (showTextPreviewFor(tWin) && (MatchWildcard(L"*.txt", icons[idx].path) || MatchWildcard(L"*.md", icons[idx].path)));
                     if (isTxt) {
-                        int w_base = textWidgetWidth;
+                        testSpan += getItemSpan(true);
+                        int w_base = layoutTextWidgetWidth;
                         int maxShrink = w_base / 6;
                         minRequiredWidth += (w_base - maxShrink);
                     } else {
+                        testSpan += 1;
                         minRequiredWidth += iconSize;
                     }
                 }
@@ -278,7 +309,9 @@ namespace PoggetCore {
                     minRequiredWidth += (testNumItems - 1) * min_gap;
                 }
 
-                if (minRequiredWidth > availableWidth && !currentTempRow.iconIndices.empty()) {
+                if ((minRequiredWidth > availableWidth ||
+                    (customLayout && testSpan > iconsPerRow)) &&
+                    !currentTempRow.iconIndices.empty()) {
                     currentTempRow.isFull = true;
                     layoutRows.push_back(currentTempRow);
                     currentTempRow.iconIndices.clear();
@@ -325,7 +358,7 @@ namespace PoggetCore {
                 }
 
                 bool isTxt = (!isList && showTextPreviewFor(targetWin) && (MatchWildcard(L"*.txt", icons[i].path) || MatchWildcard(L"*.md", icons[i].path)));
-                int itemSpan = isTxt ? 2 : 1;
+                int itemSpan = getItemSpan(isTxt);
                 if (tempCursorX + itemSpan > iconsPerRow && tempCursorX > 0) {
                     if (!currentTempRow.iconIndices.empty()) {
                         layoutRows.push_back(currentTempRow);
@@ -419,7 +452,7 @@ namespace PoggetCore {
 
             icons[i].isCollapsed = false;
             bool isTxt = (!isList && showTextPreviewFor(targetWin) && (MatchWildcard(L"*.txt", icons[i].path) || MatchWildcard(L"*.md", icons[i].path)));
-            int itemSpan = isTxt ? 2 : 1;
+            int itemSpan = getItemSpan(isTxt);
 
             if (mainData.IconSpacingType == 1 && !isList) {
                 bool needsWrap = (i > 0 && iconToRowMap[i] != iconToRowMap[i - 1]);
@@ -452,7 +485,7 @@ namespace PoggetCore {
                     for (size_t idx : row.iconIndices) {
                         void* tWin = icons[idx].originWindow ? icons[idx].originWindow : containerWin;
                         bool isTxt = (!isList && showTextPreviewFor(tWin) && (MatchWildcard(L"*.txt", icons[idx].path) || MatchWildcard(L"*.md", icons[idx].path)));
-                        totalSpan += isTxt ? 2 : 1;
+                        totalSpan += getItemSpan(isTxt);
                     }
                     bool isRowFull = row.isFull || (totalSpan >= iconsPerRow);
 
@@ -463,7 +496,7 @@ namespace PoggetCore {
                         bool isTxt = (!isList && showTextPreviewFor(tWin) && (MatchWildcard(L"*.txt", icons[idx].path) || MatchWildcard(L"*.md", icons[idx].path)));
                         if (isTxt) {
                             numWidgets++;
-                            totalUnshrunkWidth += textWidgetWidth;
+                            totalUnshrunkWidth += layoutTextWidgetWidth;
                         } else {
                             totalUnshrunkWidth += iconSize;
                         }
@@ -487,12 +520,12 @@ namespace PoggetCore {
                             }
                             int diff = requiredSpace - totalItemsWidth;
                             if (diff > 0) {
-                                int maxTotalStretch = numWidgets * (textWidgetWidth / 4);
+                                int maxTotalStretch = numWidgets * (layoutTextWidgetWidth / 4);
                                 int actualTotalStretch = (diff < maxTotalStretch) ? diff : maxTotalStretch;
                                 stretchPerWidget = actualTotalStretch / numWidgets;
                                 totalItemsWidth += actualTotalStretch;
                             } else if (diff < 0) {
-                                int maxTotalShrink = numWidgets * (textWidgetWidth / 6);
+                                int maxTotalShrink = numWidgets * (layoutTextWidgetWidth / 6);
                                 int actualTotalShrink = (-diff < maxTotalShrink) ? -diff : maxTotalShrink;
                                 stretchPerWidget = -actualTotalShrink / numWidgets;
                                 totalItemsWidth -= actualTotalShrink;
@@ -533,7 +566,7 @@ namespace PoggetCore {
                         for (size_t idx : row.iconIndices) {
                             void* tWin = icons[idx].originWindow ? icons[idx].originWindow : containerWin;
                             bool isTxt = (!isList && showTextPreviewFor(tWin) && (MatchWildcard(L"*.txt", icons[idx].path) || MatchWildcard(L"*.md", icons[idx].path)));
-                            if (isTxt) icons[idx].customWidth = static_cast<float>(textWidgetWidth + stretchPerWidget);
+                            if (isTxt) icons[idx].customWidth = static_cast<float>(layoutTextWidgetWidth + stretchPerWidget);
                             else icons[idx].customWidth = -1.0f;
                         }
                     } else {
@@ -543,7 +576,7 @@ namespace PoggetCore {
                             void* tWin = icons[idx].originWindow ? icons[idx].originWindow : containerWin;
                             bool isTxt = !isList && showTextPreviewFor(tWin) &&
                                 (MatchWildcard(L"*.txt", icons[idx].path) || MatchWildcard(L"*.md", icons[idx].path));
-                            icons[idx].customWidth = isTxt ? static_cast<float>(textWidgetWidth) : -1.0f;
+                            icons[idx].customWidth = isTxt ? static_cast<float>(layoutTextWidgetWidth) : -1.0f;
                         }
                     }
                 }
@@ -551,15 +584,23 @@ namespace PoggetCore {
             }
 
             if (isTxt && icons[i].customWidth <= 0.0f) {
-                icons[i].customWidth = static_cast<float>(textWidgetWidth);
+                icons[i].customWidth = static_cast<float>(layoutTextWidgetWidth);
             }
 
             int newX;
             if (mainData.IconSpacingType == 1 && !isList) {
                 newX = static_cast<int>(std::round(rowAccumulatedX));
-                rowAccumulatedX += (icons[i].customWidth > 0.0f ? icons[i].customWidth : static_cast<float>(isTxt ? textWidgetWidth : iconSize)) + rowGapX;
+                rowAccumulatedX += (icons[i].customWidth > 0.0f
+                    ? icons[i].customWidth
+                    : static_cast<float>(isTxt ? layoutTextWidgetWidth : iconSize)) + rowGapX;
             } else {
-                newX = actualStartX + centeredOffsetX + (isList ? 0 : cursorX * (iconSize + gapX));
+                if (customLayout && isTxt && iconsPerRow == 1) {
+                    const int itemWidth = static_cast<int>(std::lround(icons[i].customWidth));
+                    newX = actualStartX + (std::max)(0, availableWidth - itemWidth) / 2;
+                } else {
+                    newX = actualStartX + centeredOffsetX +
+                        (isList ? 0 : cursorX * (iconSize + gapX));
+                }
             }
 
             icons[i].targetX = static_cast<float>(newX);
@@ -574,6 +615,342 @@ namespace PoggetCore {
                 }
             }
         }
+
+        if (isIntegrated && !isInlineManager && !isSearchManager && sectionInputs) {
+            std::set<void*> representedOrigins;
+            int nextSectionY = startY;
+            for (const auto& header : outHeaders) {
+                representedOrigins.insert(header.originWindow);
+                nextSectionY = (std::max)(nextSectionY, header.y2 + 15);
+            }
+            for (const auto& icon : icons) {
+                if (!icon.isVisible || icon.isCollapsed || icon.targetY < -50.0f) continue;
+                void* targetWin = icon.originWindow ? icon.originWindow : containerWin;
+                nextSectionY = (std::max)(nextSectionY,
+                    static_cast<int>(std::lround(icon.targetY)) +
+                    getAdjustedStep(targetWin));
+            }
+            for (const auto& section : *sectionInputs) {
+                if (!section.originWindow || representedOrigins.count(section.originWindow)) {
+                    continue;
+                }
+                CoreSectionHeaderLayoutData header;
+                header.originWindow = section.originWindow;
+                header.x1 = actualStartX + centeredOffsetX;
+                header.y1 = nextSectionY;
+                header.y2 = nextSectionY + 43;
+                header.x2 = containerWidth - (actualStartX + centeredOffsetX);
+                header.title = section.title.empty()
+                    ? getConfig(section.originWindow).title : section.title;
+                outHeaders.push_back(header);
+                representedOrigins.insert(section.originWindow);
+                nextSectionY += 58;
+            }
+        }
+
+        if (pagedLayout) {
+            std::map<int, std::vector<size_t>> rows;
+            for (size_t i = 0; i < icons.size(); ++i) {
+                if (!icons[i].isVisible || icons[i].isCollapsed || icons[i].targetY < -50.0f) {
+                    continue;
+                }
+                rows[static_cast<int>(std::lround(icons[i].targetY))].push_back(i);
+            }
+
+            int rowsPerPage = (std::max)(1, mainData.PagedLayoutMaxRows);
+            const int indicatorReserve = horizontalPages ? 34 : 16;
+            const int availablePageHeight = containerHeight > 0
+                ? (std::max)(1, containerHeight - startY - indicatorReserve)
+                : (std::numeric_limits<int>::max)() / 4;
+            if (containerHeight > 0) {
+                const int rowStep = (std::max)(1, getAdjustedStep(containerWin));
+                const int rowsThatFit = (std::max)(1,
+                    static_cast<int>(std::floor(
+                        static_cast<double>(availablePageHeight + gapY) / rowStep)));
+                rowsPerPage = (std::min)(rowsPerPage, rowsThatFit);
+            }
+
+            std::vector<float> pageOrigins;
+            if (mainData.IsIntegrated) {
+                std::map<void*, std::vector<int>> sectionRowYs;
+                for (const auto& rowEntry : rows) {
+                    if (rowEntry.second.empty()) continue;
+                    const auto& firstIcon = icons[rowEntry.second.front()];
+                    void* targetWin = firstIcon.originWindow
+                        ? firstIcon.originWindow : containerWin;
+                    sectionRowYs[targetWin].push_back(rowEntry.first);
+                }
+
+                const std::vector<CoreSectionHeaderLayoutData> originalHeaders = outHeaders;
+                outHeaders.clear();
+                int currentPage = -1;
+                int currentPageRows = 0;
+                bool pageHasContent = false;
+
+                auto startPage = [&](float originY) {
+                    ++currentPage;
+                    pageOrigins.push_back(originY);
+                    currentPageRows = 0;
+                    pageHasContent = false;
+                };
+                auto assignRowToPage = [&](int rowY, int pageIndex) {
+                    auto rowIt = rows.find(rowY);
+                    if (rowIt == rows.end()) return;
+                    for (size_t iconIndex : rowIt->second) {
+                        icons[iconIndex].pageIndex = pageIndex;
+                    }
+                };
+                auto rowEndY = [&](int rowY, void* originWindow) {
+                    return rowY + (std::max)(1, getAdjustedStep(originWindow));
+                };
+
+                for (const auto& sourceHeader : originalHeaders) {
+                    CoreSectionHeaderLayoutData header = sourceHeader;
+                    auto groupIt = sectionRowYs.find(header.originWindow);
+                    const std::vector<int> emptyRows;
+                    const auto& groupRows = groupIt != sectionRowYs.end()
+                        ? groupIt->second : emptyRows;
+                    const int groupEndY = groupRows.empty()
+                        ? header.y2 + 15
+                        : rowEndY(groupRows.back(), header.originWindow);
+                    const int groupRowCount = static_cast<int>(groupRows.size());
+                    const bool groupFitsFreshPage =
+                        groupRowCount <= rowsPerPage &&
+                        groupEndY - header.y1 <= availablePageHeight;
+
+                    if (currentPage < 0) startPage(static_cast<float>(header.y1));
+                    const bool groupFitsCurrentPage =
+                        currentPageRows + groupRowCount <= rowsPerPage &&
+                        groupEndY - pageOrigins[static_cast<size_t>(currentPage)] <=
+                            availablePageHeight;
+                    if (pageHasContent &&
+                        (!groupFitsCurrentPage || !groupFitsFreshPage)) {
+                        startPage(static_cast<float>(header.y1));
+                    }
+
+                    header.pageIndex = currentPage;
+                    outHeaders.push_back(header);
+                    pageHasContent = true;
+
+                    int rowsInCurrentChunk = 0;
+                    int continuationIndex = 0;
+                    for (int rowY : groupRows) {
+                        const int endY = rowEndY(rowY, header.originWindow);
+                        const bool exceedsRowLimit = currentPageRows >= rowsPerPage;
+                        const bool exceedsHeight =
+                            endY - pageOrigins[static_cast<size_t>(currentPage)] >
+                                availablePageHeight;
+                        if (rowsInCurrentChunk > 0 &&
+                            (exceedsRowLimit || exceedsHeight)) {
+                            CoreSectionHeaderLayoutData continuation = sourceHeader;
+                            continuation.isContinuation = true;
+                            continuation.continuationIndex = ++continuationIndex;
+                            continuation.y1 = rowY - 58;
+                            continuation.y2 = continuation.y1 + 43;
+                            startPage(static_cast<float>(continuation.y1));
+                            continuation.pageIndex = currentPage;
+                            outHeaders.push_back(continuation);
+                            pageHasContent = true;
+                            rowsInCurrentChunk = 0;
+                        }
+                        assignRowToPage(rowY, currentPage);
+                        ++currentPageRows;
+                        ++rowsInCurrentChunk;
+                    }
+                }
+
+				std::map<void*, int> sectionPageCounts;
+				for (const auto& header : outHeaders) {
+					sectionPageCounts[header.originWindow] = (std::max)(
+						sectionPageCounts[header.originWindow],
+						header.continuationIndex + 1);
+				}
+				for (auto& header : outHeaders) {
+					header.sectionPageIndex = header.continuationIndex + 1;
+					header.sectionPageCount = (std::max)(1,
+						sectionPageCounts[header.originWindow]);
+				}
+
+                if (pageOrigins.empty()) {
+                    pageOrigins.push_back(static_cast<float>(startY));
+                }
+            }
+            else {
+                const int rowCount = static_cast<int>(rows.size());
+                const int pageCount = (std::max)(1,
+                    (rowCount + rowsPerPage - 1) / rowsPerPage);
+                pageOrigins.assign(static_cast<size_t>(pageCount),
+                    static_cast<float>(startY));
+
+                int rowOrdinal = 0;
+                for (const auto& rowEntry : rows) {
+                    const int pageIndex = rowOrdinal / rowsPerPage;
+                    if (rowOrdinal % rowsPerPage == 0) {
+                        pageOrigins[static_cast<size_t>(pageIndex)] =
+                            static_cast<float>(rowEntry.first);
+                    }
+                    for (size_t iconIndex : rowEntry.second) {
+                        icons[iconIndex].pageIndex = pageIndex;
+                    }
+                    ++rowOrdinal;
+                }
+
+                for (auto& header : outHeaders) {
+                    int headerPage = 0;
+                    bool foundFollowingIcon = false;
+                    float nearestY = (std::numeric_limits<float>::max)();
+                    for (const auto& icon : icons) {
+                        if (!icon.isVisible || icon.isCollapsed ||
+                            icon.originWindow != header.originWindow ||
+                            icon.targetY < static_cast<float>(header.y1)) {
+                            continue;
+                        }
+                        if (icon.targetY < nearestY) {
+                            nearestY = icon.targetY;
+                            headerPage = icon.pageIndex;
+                            foundFollowingIcon = true;
+                        }
+                    }
+                    if (!foundFollowingIcon && !rows.empty()) {
+                        auto rowIt = rows.lower_bound(header.y1);
+                        if (rowIt == rows.end()) rowIt = std::prev(rows.end());
+                        if (!rowIt->second.empty()) {
+                            headerPage = icons[rowIt->second.front()].pageIndex;
+                        }
+                    }
+                    header.pageIndex = std::clamp(headerPage, 0, pageCount - 1);
+                    pageOrigins[static_cast<size_t>(header.pageIndex)] = (std::min)(
+                        pageOrigins[static_cast<size_t>(header.pageIndex)],
+                        static_cast<float>(header.y1));
+                }
+            }
+
+            const int pageCount = (std::max)(1,
+                static_cast<int>(pageOrigins.size()));
+            int currentPage = std::clamp(
+                mainData.PagedLayoutCurrentPage, 0, pageCount - 1);
+            if (layoutAnchor && layoutAnchor->originWindow) {
+                int resolvedPage = -1;
+                auto resolveExactIcon = [&]() {
+                    if (!layoutAnchor->iconToken && layoutAnchor->iconId < 0) return;
+                    for (const auto& icon : icons) {
+                        if (!icon.isVisible || icon.isCollapsed ||
+                            icon.originWindow != layoutAnchor->originWindow) continue;
+                        const bool identityMatches = layoutAnchor->iconToken
+                            ? icon.stableToken == layoutAnchor->iconToken
+                            : icon.stableId == layoutAnchor->iconId;
+                        if (!identityMatches) continue;
+                        resolvedPage = icon.pageIndex;
+                        return;
+                    }
+                };
+                auto resolveGroupIcon = [&]() {
+                    if (resolvedPage >= 0) return;
+                    for (const auto& icon : icons) {
+                        if (!icon.isVisible || icon.isCollapsed ||
+                            icon.originWindow != layoutAnchor->originWindow) continue;
+                        resolvedPage = icon.pageIndex;
+                        return;
+                    }
+                };
+                auto resolveExactHeader = [&]() {
+                    if (resolvedPage >= 0) return;
+                    for (const auto& header : outHeaders) {
+                        if (header.originWindow == layoutAnchor->originWindow &&
+                            (layoutAnchor->sectionTitle.empty() ||
+                                header.title == layoutAnchor->sectionTitle) &&
+                            header.continuationIndex ==
+                                layoutAnchor->continuationIndex) {
+                            resolvedPage = header.pageIndex;
+                            return;
+                        }
+                    }
+                };
+                auto resolveGroupHeader = [&]() {
+                    if (resolvedPage >= 0) return;
+                    const CoreSectionHeaderLayoutData* bestHeader = nullptr;
+                    int bestDistance = (std::numeric_limits<int>::max)();
+                    for (const auto& header : outHeaders) {
+                        if (header.originWindow != layoutAnchor->originWindow) continue;
+                        const int distance = std::abs(
+                            header.continuationIndex -
+                            layoutAnchor->continuationIndex);
+                        if (!bestHeader || distance < bestDistance) {
+                            bestHeader = &header;
+                            bestDistance = distance;
+                        }
+                    }
+                    if (bestHeader) resolvedPage = bestHeader->pageIndex;
+                };
+
+                if (layoutAnchor->preferHeader) {
+                    resolveExactHeader();
+                    resolveGroupHeader();
+                    resolveExactIcon();
+                    resolveGroupIcon();
+                }
+                else {
+                    resolveExactIcon();
+                    resolveExactHeader();
+                    resolveGroupHeader();
+                    resolveGroupIcon();
+                }
+                if (resolvedPage >= 0) {
+                    currentPage = std::clamp(resolvedPage, 0, pageCount - 1);
+                    layoutResult.anchorResolved = true;
+                    layoutResult.resolvedAnchorPage = currentPage;
+                }
+            }
+
+            for (auto& icon : icons) {
+                if (!icon.isVisible || icon.isCollapsed || icon.targetY < -50.0f) continue;
+                const int pageIndex = std::clamp(icon.pageIndex, 0, pageCount - 1);
+                const int pageDelta = pageIndex - currentPage;
+                if (horizontalPages) {
+                    icon.targetX += static_cast<float>(pageDelta) *
+                        static_cast<float>(containerWidth);
+                    icon.targetY = static_cast<float>(startY) + icon.targetY -
+                        pageOrigins[static_cast<size_t>(pageIndex)];
+                } else {
+                    icon.targetY = static_cast<float>(startY) + icon.targetY -
+                        pageOrigins[static_cast<size_t>(pageIndex)] +
+                        static_cast<float>(pageDelta) *
+                        static_cast<float>((std::max)(1, containerHeight));
+                }
+            }
+            for (auto& header : outHeaders) {
+                const int pageIndex = std::clamp(header.pageIndex, 0, pageCount - 1);
+                const int pageDelta = pageIndex - currentPage;
+                const float originY = pageOrigins[static_cast<size_t>(pageIndex)];
+                if (horizontalPages) {
+                    const int pageShift = pageDelta * containerWidth;
+                    header.x1 += pageShift;
+                    header.x2 += pageShift;
+                    header.y1 = static_cast<int>(std::lround(
+                        static_cast<float>(startY) + header.y1 - originY));
+                    header.y2 = static_cast<int>(std::lround(
+                        static_cast<float>(startY) + header.y2 - originY));
+                } else {
+                    const int pageShift = pageDelta * (std::max)(1, containerHeight);
+                    header.y1 = static_cast<int>(std::lround(
+                        static_cast<float>(startY) + header.y1 - originY)) + pageShift;
+                    header.y2 = static_cast<int>(std::lround(
+                        static_cast<float>(startY) + header.y2 - originY)) + pageShift;
+                }
+            }
+
+            layoutResult.isPaged = true;
+            layoutResult.pageCount = pageCount;
+            layoutResult.currentPage = currentPage;
+            layoutResult.columnsPerPage = iconsPerRow;
+            layoutResult.rowsPerPage = rowsPerPage;
+        } else {
+            for (auto& icon : icons) icon.pageIndex = 0;
+            for (auto& header : outHeaders) header.pageIndex = 0;
+            layoutResult.columnsPerPage = iconsPerRow;
+        }
+
+        if (outResult) *outResult = layoutResult;
 
         // Split interaction cells at adjacent item/row midpoints. Keep 4px
         // horizontally and 2px vertically without changing rendered positions.

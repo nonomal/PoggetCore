@@ -18,9 +18,15 @@ namespace PoggetCore {
     struct CoreContainerConfig {
         bool DisableLayoutAnimations = false;
         bool IsIntegrated = false;
+        bool IsMergedHost = false;
         int SortMode = 0;
         int IconSpacingMode = 0;
         int IconSpacingType = 0;
+        bool EnablePagedLayout = false;
+        int PagedLayoutFlowMode = 0;
+        int PagedLayoutMaxColumns = 4;
+        int PagedLayoutMaxRows = 4;
+        int PagedLayoutCurrentPage = 0;
         bool IsListView = false;
         bool IsInInlineFolderView = false;
         bool IsSearchMode = false;
@@ -33,6 +39,8 @@ namespace PoggetCore {
     };
 
     struct CoreIconLayoutData {
+        int stableId = -1;
+        const void* stableToken = nullptr;
         std::wstring path;
         std::wstring alias;
         std::wstring originalPath;
@@ -57,6 +65,7 @@ namespace PoggetCore {
         bool hasInteractionClip = false;
         bool isCollapsed = false;
         bool isVisible = true;
+        int pageIndex = 0;
     };
 
     struct CoreSectionHeaderLayoutData {
@@ -66,6 +75,37 @@ namespace PoggetCore {
         int y1 = 0;
         int x2 = 0;
         int y2 = 0;
+        int pageIndex = 0;
+        bool isContinuation = false;
+        int continuationIndex = 0;
+        int sectionPageIndex = 1;
+        int sectionPageCount = 1;
+    };
+
+    struct CoreSectionLayoutInput {
+        void* originWindow = nullptr;
+        std::wstring title;
+    };
+
+    struct CoreLayoutAnchor {
+        void* originWindow = nullptr;
+        int iconId = -1;
+        const void* iconToken = nullptr;
+        std::wstring sectionTitle;
+        int continuationIndex = 0;
+        bool preferHeader = false;
+    };
+
+    struct CoreLayoutResult {
+        bool isCustomLayout = false;
+        bool isPaged = false;
+        int flowMode = 0;
+        int pageCount = 1;
+        int currentPage = 0;
+        int columnsPerPage = 1;
+        int rowsPerPage = 1;
+        bool anchorResolved = false;
+        int resolvedAnchorPage = 0;
     };
 
     class PoggetCoreManager {
@@ -109,6 +149,25 @@ namespace PoggetCore {
             std::vector<CoreSectionHeaderLayoutData>& outHeaders,
             void* containerWin,
             int containerWidth,
+            int containerHeight,
+            int startX,
+            int startY,
+            int iconSize,
+            int gap,
+            bool isSearchManager,
+            bool isInlineManager,
+            const std::function<CoreContainerConfig(void*)>& getConfig,
+            const std::function<bool(void*, const std::wstring&)>& isSectionCollapsedInSearch,
+            const std::vector<CoreSectionLayoutInput>* sectionInputs = nullptr,
+            const CoreLayoutAnchor* layoutAnchor = nullptr,
+            CoreLayoutResult* outResult = nullptr
+        );
+
+        static void CalculatePositionsCore(
+            std::vector<CoreIconLayoutData>& icons,
+            std::vector<CoreSectionHeaderLayoutData>& outHeaders,
+            void* containerWin,
+            int containerWidth,
             int startX,
             int startY,
             int iconSize,
@@ -117,7 +176,12 @@ namespace PoggetCore {
             bool isInlineManager,
             const std::function<CoreContainerConfig(void*)>& getConfig,
             const std::function<bool(void*, const std::wstring&)>& isSectionCollapsedInSearch
-        );
+        ) {
+            CalculatePositionsCore(icons, outHeaders, containerWin,
+                containerWidth, 0, startX, startY, iconSize, gap,
+                isSearchManager, isInlineManager, getConfig,
+                isSectionCollapsedInSearch, nullptr, nullptr, nullptr);
+        }
     };
 
 }
