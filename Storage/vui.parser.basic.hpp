@@ -20,13 +20,31 @@
 #include <string>
 #include <unordered_map>
 #include <locale>
-#include <functional>
 #include <iostream>
 #include <optional>
+#include <limits>
+#include <sstream>
 #include <vector>
 
 namespace vui::parser
 {
+    struct parser_limits
+    {
+        std::size_t max_input_bytes = 512ULL * 1024 * 1024;
+        std::size_t max_depth = 128;
+        std::size_t max_objects = 1'000'000;
+        std::size_t max_members = 4'000'000;
+        std::size_t max_name_length = 64 * 1024;
+        std::size_t max_value_length = 64 * 1024 * 1024;
+    };
+
+    enum class parser_error
+    {
+        none,
+        syntax,
+        resource_limit
+    };
+
     ///
     /// @class basic_value_pair <CharT>
     /// @brief 通用的 vui 键值对类。
@@ -53,7 +71,7 @@ namespace vui::parser
         bool get(T& result) const
         {
             std::any value{ pair_.second };
-            if (value.type() != typeid(T) && value.type() != typeid(string_type))
+            if (value.type() != typeid(T))
                 return false;
             result = std::any_cast<T>(value);
             return true;
@@ -85,8 +103,8 @@ namespace vui::parser
         using object_type = std::unordered_map<string_type, std::any>;
 
         basic_object() {}
-        basic_object(std::pair<string_type, basic_object<CharT>> const& pair)
-            : obj_(pair.second.obj_), name_(pair.first)
+        explicit basic_object(std::pair<string_type, basic_object<CharT>> const& pair)
+            : name_(pair.first), obj_(pair.second.obj_)
         {
             name_.erase(std::remove(name_.begin(), name_.end(), '^'),
                 name_.end());
@@ -94,6 +112,11 @@ namespace vui::parser
         basic_object(std::pair<string_type, basic_object<CharT>> const& pair, std::vector<string_type> const& order)
             : basic_object(pair) {
             order_ = order;
+        }
+        basic_object(string_type name, basic_object<CharT> const& object)
+            : name_(std::move(name)), obj_(object.obj_), order_(object.order_)
+        {
+            name_.erase(std::remove(name_.begin(), name_.end(), '^'), name_.end());
         }
 
         /// @brief 对象的迭代器。
@@ -104,33 +127,40 @@ namespace vui::parser
             /// @brief 值类型。
             using value_type = basic_value_pair<CharT>;
             /// @brief 引用类型。
-            using reference = value_type&;
+            using reference = value_type;
             /// @brief 指针类型。
             using pointer = value_type*;
 
             iterator(object_type& objs, std::vector<string_type> const& order)
                 : objs_(objs), order_(order) { }
             /// @brief 获取 vui 键值对。
-            value_type operator*() { string_type name{ order_[pos_] }; return std::make_pair(name, objs_[name]); } const
+            value_type operator*() {
+                string_type name{ order_[pos_] };
+                return value_type(typename value_type::raw_type{ std::move(name), objs_.at(order_[pos_]) });
+            }
                 /// @brief 向前移动一位。
                 iterator& operator++() { ++pos_; return *this; }
             /// @brief 向前移动一位，返回移动前的迭代器。
-            iterator const& operator++(int) { auto it{ *this }; ++*this; return it; }
+            iterator operator++(int) { auto it{ *this }; ++*this; return it; }
             /// @brief 向后移动一位。
             iterator& operator--() { --pos_; return *this; }
             /// @brief 向后移动一位，返回移动前的迭代器。
-            iterator const& operator--(int) { auto it{ *this }; --*this; return *this; }
+            iterator operator--(int) { auto it{ *this }; --*this; return it; }
             /// @brief 判断两个迭代器是否相等。
-            bool operator==(iterator const& other) { return objs_.begin() == other.objs_.begin() && objs_.end() == other.objs_.end() && pos_ == other.pos_; }
+            bool operator==(iterator const& other) { return &objs_ == &other.objs_ && pos_ == other.pos_; }
             /// @brief 判断两个迭代器是否不相等。
             bool operator!=(iterator const& other) { return !(*this == other); }
             /// @brief 访问对象。
-            reference operator->() { return **this; }
+            pointer operator->() {
+                current_value_.emplace(**this);
+                return &current_value_.value();
+            }
 
         private:
             object_type& objs_;
             std::vector<string_type> const& order_;
             std::size_t pos_{ 0 };
+            std::optional<value_type> current_value_;
         };
 
         /// @brief 获取对象的起始迭代器。
@@ -163,7 +193,7 @@ namespace vui::parser
         /// @param key 要访问的键。
         std::any const& operator[](string_type const& key) const
         {
-            return obj_[key];
+            return obj_.at(key);
         }
 
         /// @brief 访问对象。
@@ -176,15 +206,15 @@ namespace vui::parser
         /// @brief 添加对象。
         void add(string_type const& key, std::any& value)
         {
+            if (obj_.find(key) == obj_.end()) order_.emplace_back(key);
             obj_[key] = value;
-            order_.emplace_back(std::move(key));
         }
 
         /// @brief 添加对象（右值引用）。
         void add(string_type const& key, std::any&& value)
         {
+            if (obj_.find(key) == obj_.end()) order_.emplace_back(key);
             obj_[key] = std::move(value);
-            order_.emplace_back(std::move(key));
         }
 
         /// @brief 获取数据顺序。
@@ -210,7 +240,7 @@ namespace vui::parser
     public:
         /// @brief 初始化器。
         basic_object(object_type&& obj)
-            : obj_(obj) { }
+            : obj_(std::move(obj)) { }
     };
 
     ///
@@ -234,20 +264,20 @@ namespace vui::parser
         /// @brief 初始化器。
     /// @param s 要解析的流。
         template<typename T>
-        basic_parser(T const& s) noexcept // 保留旧的 const& 构造函数
+        basic_parser(T const& s) // 保留旧的 const& 构造函数
             : stream_(s) { } // 对于可拷贝的类型，这仍然是有效的
 
         /// @brief 初始化器。
         /// @param s 要解析的流。
         template<typename T>
-        basic_parser(T&& s) noexcept // 新增移动构造函数
+        basic_parser(T&& s) // 新增移动构造函数
             : stream_(std::forward<T>(s)) { } // 使用 std::forward 处理左值和右值
 
         /// @brief 初始化器。
         /// @param s 要解析的流。
         /// @param region 要解析的 region。
         template<typename T>
-        basic_parser(T const& s, string_type const& region) noexcept
+        basic_parser(T const& s, string_type const& region)
             : stream_(s)
             , region_(region) { }
 
@@ -255,16 +285,20 @@ namespace vui::parser
         /// @param s 要解析的流。
         /// @param region 要解析的 region。
         template<typename T>
-        basic_parser(T&& s, string_type const& region) noexcept
+        basic_parser(T&& s, string_type const& region)
             : stream_(std::forward<T>(s))
             , region_(region) { }
 
         /// @brief 设置 region。
         /// @param region 要解析的 region。
-        void set_region(string_type const& region) noexcept { region_ = region; }
+        void set_region(string_type const& region) { region_ = region; }
         /// @brief 获取 region。
         /// @return 要解析的的 region。
         string_type const& region() const noexcept { return region_; }
+
+        void set_limits(parser_limits limits) noexcept { limits_ = limits; }
+        parser_limits const& limits() const noexcept { return limits_; }
+        parser_error error() const noexcept { return error_; }
 
         /// @brief 获取数据。
         /// @param key 要获取的数据的名称。
@@ -275,44 +309,47 @@ namespace vui::parser
         /// 若在 `get` 前未进行过 `parse`，将会自动执行一次 `parse`。
         /// 同名对象可使用 `same_name_object` 函数进行名称处理。
         template <typename T = string_type>
-        bool get(string_type const& key, T& result, std::optional<string_type> const& name = std::nullopt) noexcept
+        bool get(string_type const& key, T& result, std::optional<string_type> const& name = std::nullopt)
         {
-            if (!objs_.has_value())
-            {
-                parse();
-            }
+            if (!objs_.has_value() && !parse()) return false;
+            if (!objs_.has_value() || objs_->empty()) return false;
             auto& objs{ objs_.value() };
-            object_type obj;
-            if (!name.has_value())
-                obj = objs.begin()->second;
-            else if (!objs.count(name.value()))
-                return false;
-            else
-                obj = objs[name.value()];
+            const object_type* obj = nullptr;
+            if (!name.has_value()) {
+                obj = &objs.begin()->second;
+            }
+            else {
+                auto it = objs.find(name.value());
+                if (it == objs.end()) return false;
+                obj = &it->second;
+            }
 
-            if (!obj.count(key))
+            if (!obj->count(key))
                 return false;
-            std::any value{ obj[key] };
+            const std::any& value = (*obj)[key];
             if (value.type() != typeid(T))
                 return false;
             result = std::any_cast<T>(value);
             return true;
         }
         template <typename T = string_type>
-        bool get2(string_type const& key, T& result, std::optional<string_type> const& name = std::nullopt) noexcept
+        bool get2(string_type const& key, T& result, std::optional<string_type> const& name = std::nullopt)
         {
+            if (!objs_.has_value() || objs_->empty()) return false;
             auto& objs{ objs_.value() };
-            object_type obj;
-            if (!name.has_value())
-                obj = objs.begin()->second;
-            else if (!objs.count(name.value()))
-                return false;
-            else
-                obj = objs[name.value()];
+            const object_type* obj = nullptr;
+            if (!name.has_value()) {
+                obj = &objs.begin()->second;
+            }
+            else {
+                auto it = objs.find(name.value());
+                if (it == objs.end()) return false;
+                obj = &it->second;
+            }
 
-            if (!obj.count(key))
+            if (!obj->count(key))
                 return false;
-            std::any value{ obj[key] };
+            const std::any& value = (*obj)[key];
             if (value.type() != typeid(T))
                 return false;
             result = std::any_cast<T>(value);
@@ -323,27 +360,28 @@ namespace vui::parser
         /// 
         /// 只能 `parse` 一次，多次 `parse` 将返回 `false`。
         /// 对象名禁用 「^」。
-        bool parse() noexcept
+        bool parse()
         {
-            objs_ = std::unordered_map<string_type, object_type>{};
-            CharT c{};
+            objs_ = objects_type{};
+            order_.clear();
+            error_ = parser_error::none;
+            object_count_ = 0;
+            member_count_ = 0;
             stream_ >> std::noskipws;
-            while ((!stream_.eof()) && (stream_ >> c))
-            {
-                switch (c)
-                {
-                case '#': return parse_preprocessor();
-                default: {
-                    if (!parse_object(c)) return false;
-                    while ((c = skip_whitespace()) && !(stream_.eof()))
-                    {
-                        if (!parse_object(c)) return false;
-                    }
-                    return true;
+
+            CharT c{};
+            if (!read_non_whitespace(c)) return fail(parser_error::syntax);
+            if (c == static_cast<CharT>('#')) return parse_preprocessor();
+
+            do {
+                if (!parse_object(c)) {
+                    objs_.reset();
+                    order_.clear();
+                    return fail(error_ == parser_error::none ? parser_error::syntax : error_);
                 }
-                }
-            }
-            return false;
+            } while (read_non_whitespace(c));
+
+            return objs_.has_value() && !objs_->empty();
         }
 
         /// @brief 对象的迭代器。
@@ -354,26 +392,33 @@ namespace vui::parser
             /// @brief 值类型。
             using value_type = object_type;
             /// @brief 引用类型。
-            using reference = value_type&;
+            using reference = value_type;
             /// @brief 指针类型。
             using pointer = value_type*;
 
             /// @brief 获取 vui 对象。
-            value_type operator*() { string_type name{ order_[pos_] }; return { std::make_pair(name, objs_[name]), objs_[name].order() }; } const
+            value_type operator*() {
+                const string_type& name = order_[pos_];
+                const auto& object = objs_.at(name);
+                return value_type(name, object);
+            }
                 /// @brief 向前移动一位。
                 iterator& operator++() { ++pos_; return *this; }
             /// @brief 向前移动一位，返回移动前的迭代器。
-            iterator const& operator++(int) { auto it{ *this }; ++*this; return it; }
+            iterator operator++(int) { auto it{ *this }; ++*this; return it; }
             /// @brief 向后移动一位。
             iterator& operator--() { --pos_; return *this; }
             /// @brief 向后移动一位，返回移动前的迭代器。
-            iterator const& operator--(int) { auto it{ *this }; --*this; return *this; }
+            iterator operator--(int) { auto it{ *this }; --*this; return it; }
             /// @brief 判断两个迭代器是否相等。
-            bool operator==(iterator const& other) { return objs_.begin() == other.objs_.begin() && objs_.end() == other.objs_.end() && pos_ == other.pos_; }
+            bool operator==(iterator const& other) { return &objs_ == &other.objs_ && pos_ == other.pos_; }
             /// @brief 判断两个迭代器是否不相等。
             bool operator!=(iterator const& other) { return !(*this == other); }
             /// @brief 访问对象。
-            reference operator->() { return **this; }
+            pointer operator->() {
+                current_value_.emplace(**this);
+                return &current_value_.value();
+            }
 
             iterator(std::unordered_map<string_type, object_type>& objs, std::vector<string_type> const& order)
                 : objs_(objs), order_(order) { }
@@ -382,6 +427,7 @@ namespace vui::parser
             std::unordered_map<string_type, object_type>& objs_;
             std::vector<string_type> const& order_;
             std::size_t pos_{ 0 };
+            std::optional<value_type> current_value_;
 
             bool end() { return pos_ >= order_.size(); }
         };
@@ -407,8 +453,23 @@ namespace vui::parser
         std::optional<objects_type> objs_;
         std::vector<string_type> order_;
         string_type region_;
+        parser_limits limits_{};
+        parser_error error_{ parser_error::none };
+        std::size_t object_count_{ 0 };
+        std::size_t member_count_{ 0 };
 
-        bool parse_preprocessor() noexcept
+        bool fail(parser_error value) noexcept
+        {
+            if (error_ == parser_error::none) error_ = value;
+            return false;
+        }
+
+        static bool exceeds(std::size_t value, std::size_t limit) noexcept
+        {
+            return limit != 0 && value > limit;
+        }
+
+        bool parse_preprocessor()
         {
             if (region_.empty()) return true;
 
@@ -433,7 +494,7 @@ namespace vui::parser
             c = skip_whitespace();
             while (c != '#' && (!stream_.eof()))
             {
-                parse_object(c);
+                if (!parse_object(c)) return false;
                 stream_ >> c;
             }
             if (stream_.eof()) return false;
@@ -442,46 +503,60 @@ namespace vui::parser
             return true;
         }
 
-        bool parse_members(object_type& obj) noexcept
+        bool parse_members(object_type& obj, std::size_t depth)
         {
-            CharT c = skip_whitespace();
-            while (c != '}' && !stream_.eof())
+            if (exceeds(depth, limits_.max_depth)) return fail(parser_error::resource_limit);
+            CharT c{};
+            if (!read_non_whitespace(c)) return fail(parser_error::syntax);
+            while (c != static_cast<CharT>('}'))
             {
                 /// 逗号处理
-                if (c == ',') {
-                    c = skip_whitespace();
-                    if (c == '}') break;
+                if (c == static_cast<CharT>(',')) {
+                    if (!read_non_whitespace(c)) return false;
+                    if (c == static_cast<CharT>('}')) return true;
                 }
 
                 /// 读取 Key
                 string_type key;
                 /// 读取直到遇到分隔符 (、:、{ 或空白
-                while (c != '(' && c != ':' && c != '{' && !isspace(c) && c != ',' && c != '}') {
+                while (c != static_cast<CharT>('(') && c != static_cast<CharT>(':') &&
+                    c != static_cast<CharT>('{') && !is_space(c) &&
+                    c != static_cast<CharT>(',') && c != static_cast<CharT>('}')) {
                     key += c;
-                    stream_ >> c;
+                    if (exceeds(key.size(), limits_.max_name_length)) return fail(parser_error::resource_limit);
+                    if (!stream_.get(c)) return fail(parser_error::syntax);
                 }
+                if (key.empty()) return fail(parser_error::syntax);
 
                 /// 跳过键名和分隔符之间的空白
-                while (isspace(c)) stream_ >> c;
+                while (is_space(c)) {
+                    if (!stream_.get(c)) return fail(parser_error::syntax);
+                }
+
+                if (obj.count(key)) return fail(parser_error::syntax);
+                if (exceeds(++member_count_, limits_.max_members)) return fail(parser_error::resource_limit);
 
                 CharT separator = c;
                 std::any value;
 
-                if (separator == '(') {
-                    if (!read_value(value, c, [](CharT x) { return x == ')'; })) return false;
-                    c = skip_whitespace();
+                if (separator == static_cast<CharT>('(')) {
+                    if (!read_value(value, c, [](CharT x) { return x == static_cast<CharT>(')'); })) return false;
+                    if (!read_non_whitespace(c)) return fail(parser_error::syntax);
                 }
-                else if (separator == ':') {
-                    if (!read_value(value, c, [](CharT x) { return x == ',' || x == '}'; })) return false;
+                else if (separator == static_cast<CharT>(':')) {
+                    if (!read_value(value, c, [](CharT x) {
+                        return x == static_cast<CharT>(',') || x == static_cast<CharT>('}');
+                    })) return false;
                 }
-                else if (separator == '{') {
+                else if (separator == static_cast<CharT>('{')) {
                     object_type nested_obj;
-                    if (!parse_members(nested_obj)) return false;
-                    value = nested_obj;
-                    c = skip_whitespace();
+                    if (exceeds(++object_count_, limits_.max_objects)) return fail(parser_error::resource_limit);
+                    if (!parse_members(nested_obj, depth + 1)) return false;
+                    value = std::move(nested_obj);
+                    if (!read_non_whitespace(c)) return fail(parser_error::syntax);
                 }
                 else {
-                    return false;
+                    return fail(parser_error::syntax);
                 }
 
                 obj.add(key, std::move(value));
@@ -489,184 +564,239 @@ namespace vui::parser
             return true;
         }
 
-        bool parse_object(CharT c) noexcept
+        bool parse_object(CharT c)
         {
             string_type name{ c };
-            if (!read_to('{', name)) return false;
+            if (!read_to(static_cast<CharT>('{'), name, limits_.max_name_length)) return false;
+
+            while (!name.empty() && is_space(name.back())) name.pop_back();
+            if (name.empty()) return fail(parser_error::syntax);
 
             object_type obj;
-            if (!parse_members(obj)) return false;
+            if (exceeds(++object_count_, limits_.max_objects)) return fail(parser_error::resource_limit);
+            if (!parse_members(obj, 1)) return false;
 
-            while (objs_->count(name)) name += '^';
-            objs_.value()[name] = obj;
-            if (!is_virtual_object(name))
+            if (objs_->count(name)) return fail(parser_error::syntax);
+            objs_->emplace(name, std::move(obj));
+            if (name.front() != static_cast<CharT>('@'))
                 order_.emplace_back(std::move(name));
             return true;
         }
 
-        CharT skip_whitespace() noexcept
+        CharT skip_whitespace()
         {
             CharT c{};
-            while ((stream_ >> c) && c <= 255 && isspace(c));
+            while (stream_.get(c) && is_space(c));
             return c;
         }
 
-        void skip_to(CharT end) noexcept
+        bool read_non_whitespace(CharT& c)
+        {
+            while (stream_.get(c)) {
+                if (!is_space(c)) return true;
+            }
+            return false;
+        }
+
+        void skip_to(CharT end)
         {
             CharT c{};
-            while ((stream_ >> c) && c != end);
+            while (stream_.get(c) && c != end);
         }
 
-        bool read_to(CharT end, string_type& out) noexcept
+        bool read_to(CharT end, string_type& out, std::size_t max_length)
         {
-            CharT c{ skip_whitespace() };
-            while ((c != end) && (!stream_.eof()))
-            {
+            CharT c{};
+            while (stream_.get(c)) {
+                if (c == end) return true;
                 out += c;
-                stream_ >> c;
+                if (exceeds(out.size(), max_length)) return fail(parser_error::resource_limit);
             }
-            return !stream_.eof();
+            return fail(parser_error::syntax);
         }
-        /// 新的read_value
-        bool read_value(std::any& out, CharT& c, std::function<bool(CharT)> is_end) noexcept
+        static bool is_space(CharT c) noexcept
         {
-            bool is_integer = true, is_decimal = true;
+            return c == static_cast<CharT>(' ') || c == static_cast<CharT>('\t') ||
+                c == static_cast<CharT>('\n') || c == static_cast<CharT>('\r') ||
+                c == static_cast<CharT>('\f') || c == static_cast<CharT>('\v');
+        }
 
-            stream_ >> c;
-            while (isspace(c)) stream_ >> c;
+        static bool is_digit(CharT c) noexcept
+        {
+            return c >= static_cast<CharT>('0') && c <= static_cast<CharT>('9');
+        }
 
-            string_type s{};
-            bool is_negative{ false };
+        static bool parse_integer(const string_type& text, int& result) noexcept
+        {
+            if (text.empty()) return false;
 
+            std::size_t pos = 0;
+            bool negative = false;
+            if (text[pos] == static_cast<CharT>('-') || text[pos] == static_cast<CharT>('+')) {
+                negative = text[pos] == static_cast<CharT>('-');
+                if (++pos == text.size()) return false;
+            }
 
-            while (!is_end(c) && (!stream_.eof()))
-            {
-                // *** 修复：值终止检查（针对非引号包裹的值）***
-                if (!s.empty() && isspace(c)) {
-                    // 如果 s 中已有内容（说明值已经开始读取），且当前字符是空白，则认为值已经结束。
-                    stream_ >> c;
-                    while (isspace(c) && !stream_.eof()) {
-                        stream_ >> c;
-                    }
-                    break; // 跳出主循环
+            const std::uintmax_t limit = negative
+                ? static_cast<std::uintmax_t>(-(std::numeric_limits<int>::min() + 1)) + 1
+                : static_cast<std::uintmax_t>(std::numeric_limits<int>::max());
+            std::uintmax_t value = 0;
+            for (; pos < text.size(); ++pos) {
+                if (!is_digit(text[pos])) return false;
+                const unsigned digit = static_cast<unsigned>(text[pos] - static_cast<CharT>('0'));
+                if (value > (limit - digit) / 10) return false;
+                value = value * 10 + digit;
+            }
+
+            if (negative) {
+                result = value == limit
+                    ? std::numeric_limits<int>::min()
+                    : -static_cast<int>(value);
+            }
+            else {
+                result = static_cast<int>(value);
+            }
+            return true;
+        }
+
+        static bool has_decimal_syntax(const string_type& text) noexcept
+        {
+            if (text.empty()) return false;
+
+            std::size_t pos = 0;
+            if (text[pos] == static_cast<CharT>('-') || text[pos] == static_cast<CharT>('+')) {
+                if (++pos == text.size()) return false;
+            }
+
+            bool has_digit = false;
+            bool has_fraction_or_exponent = false;
+            while (pos < text.size() && is_digit(text[pos])) {
+                has_digit = true;
+                ++pos;
+            }
+            if (pos < text.size() && text[pos] == static_cast<CharT>('.')) {
+                has_fraction_or_exponent = true;
+                ++pos;
+                while (pos < text.size() && is_digit(text[pos])) {
+                    has_digit = true;
+                    ++pos;
                 }
-                // ****************************************
+            }
+            if (!has_digit) return false;
 
-                if (!isdigit(c))
-                {
-                    if (c == '"')
-                    {
-                        // 判断这个 " 是否被前面的反斜杠转义
-                        // 计算 s 末尾连续反斜杠的数量，偶数个表示 \ 自身被转义了，" 不是转义的
-                        size_t trailing_backslashes = 0;
-                        for (auto rit = s.rbegin(); rit != s.rend() && *rit == '\\'; ++rit) {
-                            ++trailing_backslashes;
-                        }
+            if (pos < text.size() &&
+                (text[pos] == static_cast<CharT>('e') || text[pos] == static_cast<CharT>('E'))) {
+                has_fraction_or_exponent = true;
+                ++pos;
+                if (pos < text.size() &&
+                    (text[pos] == static_cast<CharT>('-') || text[pos] == static_cast<CharT>('+'))) {
+                    ++pos;
+                }
+                const std::size_t exponent_start = pos;
+                while (pos < text.size() && is_digit(text[pos])) ++pos;
+                if (pos == exponent_start) return false;
+            }
 
-                        if (s.empty() || trailing_backslashes % 2 == 0)
-                        {
-                            is_integer = is_decimal = false; // 明确标记为字符串
+            return has_fraction_or_exponent && pos == text.size();
+        }
 
-                            s += c;
-                            stream_ >> c;
-                            // 修复：正确判断引号结束——计算 " 前连续反斜杠数量，偶数个表示 " 是真结束符
-                            while (!stream_.eof()) {
-                                if (c == '"') {
-                                    // 计算当前 s 末尾连续反斜杠的数量
-                                    size_t bs_count = 0;
-                                    for (auto rit = s.rbegin(); rit != s.rend() && *rit == '\\'; ++rit) {
-                                        ++bs_count;
-                                    }
-                                    if (bs_count % 2 == 0) {
-                                        // 偶数个反斜杠：" 是真正的结束引号
-                                        break;
-                                    }
-                                }
-                                s += c;
-                                stream_ >> c;
+        static bool parse_decimal(const string_type& text, double& result)
+        {
+            if (!has_decimal_syntax(text)) return false;
+            std::basic_istringstream<CharT> input(text);
+            input.imbue(std::locale::classic());
+            input >> std::noskipws >> result;
+            if (!input) return false;
+            CharT extra{};
+            return !input.get(extra);
+        }
+
+        template <typename EndPredicate>
+        bool read_value(std::any& out, CharT& c, EndPredicate&& is_end)
+        {
+            if (!read_non_whitespace(c)) return false;
+
+            if (c == static_cast<CharT>('"')) {
+                string_type value;
+                while (stream_.get(c)) {
+                    if (c == static_cast<CharT>('"')) {
+                        while (stream_.get(c)) {
+                            if (is_end(c)) {
+                                out = std::move(value);
+                                return true;
                             }
-                            s += c;
-                            stream_ >> c;
-                            continue;
+                            if (!is_space(c)) return false;
+                        }
+                        return false;
+                    }
+
+                    if (c == static_cast<CharT>('\\')) {
+                        CharT escaped{};
+                        if (!stream_.get(escaped)) return false;
+                        if (escaped == static_cast<CharT>('\\') || escaped == static_cast<CharT>('"')) {
+                            value += escaped;
                         }
                         else {
-                            s.back() = '"';
-                            c = '\0';
+                            value += static_cast<CharT>('\\');
+                            value += escaped;
                         }
                     }
-                    else if (!is_negative && c == '-') is_negative = true;
-                    else
-                    {
-                        is_integer = false;
-                        if (c != '.') is_decimal = false;
+                    else {
+                        value += c;
                     }
+                    if (exceeds(value.size(), limits_.max_value_length)) return fail(parser_error::resource_limit);
                 }
-                s += c;
-                stream_ >> c;
+                return fail(parser_error::syntax);
             }
 
-            // 类型转换
-            if (s.empty()) out = "";
-            // 如果是带引号的字符串，剥离引号并进行反转义。
-            // 将 \\ -> \, \" -> " 还原为字面值。
-            else if (s.front() == '"' && s.back() == '"') {
-                if (s.length() >= 2) {
-                    string_type raw = s.substr(1, s.length() - 2);
-                    // 反转义处理
-                    string_type unescaped;
-                    unescaped.reserve(raw.length());
-                    for (size_t i = 0; i < raw.length(); ++i) {
-                        if (raw[i] == '\\' && i + 1 < raw.length()) {
-                            CharT next = raw[i + 1];
-                            if (next == '\\') {
-                                unescaped += '\\';
-                                ++i; // 跳过下一个字符
-                            }
-                            else if (next == '"') {
-                                unescaped += '"';
-                                ++i;
-                            }
-                            else {
-                                // 未知转义序列，保留原样
-                                unescaped += raw[i];
-                            }
-                        }
-                        else {
-                            unescaped += raw[i];
-                        }
-                    }
-                    out = unescaped;
+            string_type value;
+            while (true) {
+                if (is_end(c)) break;
+                if (is_space(c)) {
+                    do {
+                        if (!stream_.get(c)) return false;
+                    } while (is_space(c));
+                    if (!is_end(c)) return false;
+                    break;
                 }
-                else out = "";
+                value += c;
+                if (exceeds(value.size(), limits_.max_value_length)) return fail(parser_error::resource_limit);
+                if (!stream_.get(c)) return false;
             }
-            // 数字类型判断：如果 is_integer/is_decimal 仍为 true，则转换为 int/double
-            else if (is_integer && !s.empty() && s != string_type{ L"-" }) {
-                try {
-                    out = std::stoi(s);
-                }
-                catch (...) {
-                    out = s;
-                }
-            }
-            else if (is_decimal && !s.empty() && s != string_type{ L"." }&& s != string_type{ L"-." }) {
-                try {
-                    out = std::stod(s);
-                }
-                catch (...) {
-                    out = s;
-                }
-            }
-            // 布尔值判断
-            else if (s == string_type{ L"true" }) out = true;
-            else if (s == string_type{ L"false" }) out = false;
-            // 默认解析为字符串
-            else out = s;
 
+            if (value.empty()) {
+                out = string_type{};
+                return true;
+            }
+            if (value == string_type{ static_cast<CharT>('t'), static_cast<CharT>('r'),
+                    static_cast<CharT>('u'), static_cast<CharT>('e') }) {
+                out = true;
+                return true;
+            }
+            if (value == string_type{ static_cast<CharT>('f'), static_cast<CharT>('a'),
+                    static_cast<CharT>('l'), static_cast<CharT>('s'), static_cast<CharT>('e') }) {
+                out = false;
+                return true;
+            }
+
+            int integer_value = 0;
+            if (parse_integer(value, integer_value)) {
+                out = integer_value;
+                return true;
+            }
+
+            double decimal_value = 0.0;
+            if (parse_decimal(value, decimal_value)) {
+                out = decimal_value;
+                return true;
+            }
+
+            out = std::move(value);
             return true;
         }
 
         /// 兼容旧read_string
-        bool read_string(string_type& out, bool& flag) noexcept
+        bool read_string(string_type& out, bool& flag)
         {
             CharT c{ };
             stream_ >> c;
@@ -725,7 +855,7 @@ namespace vui::parser
     template<typename C>
     bool is_virtual_object(std::basic_string<C> object_name)
     {
-        return  object_name[0] == '@';
+        return !object_name.empty() && object_name[0] == '@';
     }
 }
 

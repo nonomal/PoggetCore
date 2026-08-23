@@ -16,8 +16,11 @@ namespace PoggetCore {
             std::filesystem::path p(filePath);
             std::wstring backupPath = (p.parent_path() / L"Backups" / L"BufferBak" / p.filename()).wstring();
             m_storage.SetBackupPath(backupPath);
-            m_storage.Load(filePath);
-            m_isInitialized = true;
+            const auto result = m_storage.TryLoad(filePath);
+            m_isInitialized = result.ok();
+            if (!result.ok()) {
+                std::cerr << "PoggetStorageProvider Init Error: " << result.message << std::endl;
+            }
         } catch (const std::exception& e) {
             std::cerr << "PoggetStorageProvider Init Error: " << e.what() << std::endl;
             m_isInitialized = false;
@@ -64,6 +67,7 @@ namespace PoggetCore {
         proxy[L"fontFamily"] = model.fontFamily;
         proxy[L"DisableLayoutAnimations"] = model.DisableLayoutAnimations;
         proxy[L"IsLocked"] = model.IsLocked;
+        proxy[L"IsPositionLocked"] = model.IsPositionLocked;
         proxy[L"IsEmbeddedLayer"] = model.IsEmbeddedLayer;
         proxy[L"IsUpwardExpand"] = model.IsUpwardExpand;
         proxy[L"TransparentFrameMode"] = model.TransparentFrameMode;
@@ -74,18 +78,18 @@ namespace PoggetCore {
         proxy[L"AutoFadeDragStat"] = model.AutoFadeDragStat;
         proxy[L"FolderOpenMode"] = model.FolderOpenMode;
         proxy[L"SwipeUpSearchEnabled"] = model.SwipeUpSearchEnabled;
-        proxy[L"bgAlpha"] = static_cast<double>(model.backgroundAlpha);
-        proxy[L"titleAlpha"] = static_cast<double>(model.titleAlpha);
+        proxy[L"bgAlpha"] = model.backgroundAlpha;
+        proxy[L"titleAlpha"] = model.titleAlpha;
         proxy[L"CompatibleLayer"] = model.CompatibleLayer;
         proxy[L"EnableStaticMaterialLayerForD3D11"] = model.EnableStaticMaterialLayerForD3D11;
         proxy[L"EnableDynamicMaterialLayerForD3D11"] = model.EnableDynamicMaterialLayerForD3D11;
-        proxy[L"cornerRad"] = static_cast<double>(model.cornerRad);
-        proxy[L"shadowBlur"] = static_cast<double>(model.shadowBlur);
-        proxy[L"shadowAlpha"] = static_cast<double>(model.shadowAlpha);
-        proxy[L"shadowOffsetX"] = static_cast<double>(model.shadowOffsetX);
-        proxy[L"shadowOffsetY"] = static_cast<double>(model.shadowOffsetY);
+        proxy[L"cornerRad"] = model.cornerRad;
+        proxy[L"shadowBlur"] = model.shadowBlur;
+        proxy[L"shadowAlpha"] = model.shadowAlpha;
+        proxy[L"shadowOffsetX"] = model.shadowOffsetX;
+        proxy[L"shadowOffsetY"] = model.shadowOffsetY;
         proxy[L"EnableInlineFolderView"] = model.EnableInlineFolderView;
-        proxy[L"textSize"] = static_cast<double>(model.textSize);
+        proxy[L"textSize"] = model.textSize;
     }
 
     bool PoggetStorageProvider::LoadContainerModel(const std::wstring& containerId, ContainerModel& outModel) {
@@ -94,6 +98,9 @@ namespace PoggetCore {
         std::wstring key = FormatCompKey(containerId);
 
         outModel.id = containerId;
+        if (!m_storage.HasNestedObject(L"Components", key)) {
+            return false;
+        }
         auto proxy = m_storage[L"Components"][key];
         outModel.alias = proxy[L"alias"].get<std::wstring>(L"");
         outModel.title = proxy[L"title"].get<std::wstring>(L"Unnamed");
@@ -122,6 +129,7 @@ namespace PoggetCore {
         outModel.fontFamily = proxy[L"fontFamily"].get<std::wstring>(L"Segoe UI");
         outModel.DisableLayoutAnimations = proxy[L"DisableLayoutAnimations"].get<bool>(false);
         outModel.IsLocked = proxy[L"IsLocked"].get<bool>(false);
+        outModel.IsPositionLocked = proxy[L"IsPositionLocked"].get<bool>(outModel.IsLocked);
         outModel.IsEmbeddedLayer = proxy[L"IsEmbeddedLayer"].get<bool>(false);
         outModel.IsUpwardExpand = proxy[L"IsUpwardExpand"].get<bool>(false);
         outModel.TransparentFrameMode = proxy[L"TransparentFrameMode"].get<int>(0);
@@ -154,14 +162,15 @@ namespace PoggetCore {
         m_storage[L"Components"][key].remove();
     }
 
-    void PoggetStorageProvider::SaveStorage() {
+    bool PoggetStorageProvider::SaveStorage() {
         std::lock_guard<std::mutex> lock(m_mutex);
-        if (m_filePath.empty() || !m_isInitialized) return;
-        try {
-            m_storage.Save();
-        } catch (const std::exception& e) {
-            std::cerr << "PoggetStorageProvider Save Error: " << e.what() << std::endl;
+        if (m_filePath.empty() || !m_isInitialized) return false;
+        const auto result = m_storage.TrySave();
+        if (!result.ok()) {
+            std::cerr << "PoggetStorageProvider Save Error: " << result.message << std::endl;
+            return false;
         }
+        return true;
     }
 
     void ContainerModel::Save() {

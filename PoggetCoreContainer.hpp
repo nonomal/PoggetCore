@@ -87,6 +87,7 @@ namespace PoggetCore {
 		// Mode and state flags
 
         bool IsLocked = false;
+        bool IsPositionLocked = false;
         bool IsEmbeddedLayer = false;
         bool IsUpwardExpand = false;
         int TransparentFrameMode = 0;

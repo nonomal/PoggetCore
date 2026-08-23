@@ -6,7 +6,9 @@
 #include <vector>
 #include <sstream>
 #include <fstream>
+#include <filesystem>
 #include <iostream>
+#include <memory>
 
 class VinaBuilder;
 
@@ -14,58 +16,49 @@ class VinaObject {
 private:
     std::wstring name;
     std::vector<std::pair<std::wstring, std::wstring>> data; 
-    std::vector<VinaObject*> nestedObjects;
+    std::vector<std::unique_ptr<VinaObject>> nestedObjects;
     VinaObject* parent;
 
 public:
     VinaObject(const std::wstring& objName, VinaObject* pParent = nullptr)
         : name(objName), parent(pParent) {}
 
-    ~VinaObject() {
-        for (auto obj : nestedObjects) {
-            delete obj;
-        }
-    }
+    VinaObject(const VinaObject&) = delete;
+    VinaObject& operator=(const VinaObject&) = delete;
+    VinaObject(VinaObject&&) noexcept = default;
+    VinaObject& operator=(VinaObject&&) noexcept = default;
 
     void AddData(const std::wstring& key, const std::wstring& value) {
-        data.push_back(std::make_pair(key, value));
+        data.emplace_back(key, value);
     }
 
     VinaObject* AddObject(const std::wstring& objName) {
-        VinaObject* newObj = new VinaObject(objName, this);
-        nestedObjects.push_back(newObj);
-        return newObj;
+        auto newObj = std::make_unique<VinaObject>(objName, this);
+        VinaObject* result = newObj.get();
+        nestedObjects.push_back(std::move(newObj));
+        return result;
     }
 
     void BuildWString(std::wstringstream& ss, int depth = 0) const {
         std::wstring indent(depth * 4, L' ');
-        ss << indent << name << L"{" << std::endl;
+        ss << indent << name << L"{\n";
 
         bool first = true;
 
 
         for (const auto& kv : data) {
-            if (!first) ss << L"," << std::endl;
+            if (!first) ss << L",\n";
             ss << indent << L"    " << kv.first << L" : " << kv.second;
             first = false;
         }
 
-        for (VinaObject* obj : nestedObjects) {
-            if (!first) ss << L"," << std::endl;
-
-            std::wstringstream nestedSS;
-            obj->BuildWString(nestedSS, depth + 1);
-            std::wstring nestedStr = nestedSS.str();
-   
-            if (!nestedStr.empty() && nestedStr.back() == L'\n') {
-                nestedStr.pop_back();
-                if (!nestedStr.empty() && nestedStr.back() == L'\r') nestedStr.pop_back();
-            }
-            ss << nestedStr;
+        for (const auto& obj : nestedObjects) {
+            if (!first) ss << L",\n";
+            obj->BuildWString(ss, depth + 1);
             first = false;
         }
 
-        ss << std::endl << indent << L"}";
+        ss << L'\n' << indent << L"}";
     }
 
     std::wstring GetWString() const {
@@ -78,21 +71,20 @@ public:
 
 class VinaBuilder {
 private:
-    std::vector<VinaObject*> rootObjects;
+    std::vector<std::unique_ptr<VinaObject>> rootObjects;
 
 public:
-    VinaBuilder() {}
-
-    ~VinaBuilder() {
-        for (auto obj : rootObjects) {
-            delete obj;
-        }
-    }
+    VinaBuilder() = default;
+    VinaBuilder(const VinaBuilder&) = delete;
+    VinaBuilder& operator=(const VinaBuilder&) = delete;
+    VinaBuilder(VinaBuilder&&) noexcept = default;
+    VinaBuilder& operator=(VinaBuilder&&) noexcept = default;
 
     VinaObject* AddObject(const std::wstring& objName) {
-        VinaObject* newObj = new VinaObject(objName);
-        rootObjects.push_back(newObj);
-        return newObj;
+        auto newObj = std::make_unique<VinaObject>(objName);
+        VinaObject* result = newObj.get();
+        rootObjects.push_back(std::move(newObj));
+        return result;
     }
 
     std::wstring GetWString() const {
@@ -100,7 +92,7 @@ public:
         for (size_t i = 0; i < rootObjects.size(); ++i) {
             rootObjects[i]->BuildWString(ss);
             if (i < rootObjects.size() - 1) {
-                ss << std::endl; 
+                ss << L'\n';
             }
         }
         return ss.str();
@@ -109,14 +101,14 @@ public:
         return GetWString();
     }
     bool SaveToFile(const std::wstring& filename) const {
-        std::wofstream file(filename);
+        std::wofstream file{ std::filesystem::path(filename) };
         if (!file.is_open()) {
             return false;
         }
 
         file << GetWString();
-        file.close();
-        return true;
+        file.flush();
+        return file.good();
     }
 };
 

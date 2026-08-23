@@ -44,6 +44,14 @@ namespace PoggetCore {
             std::map<void*, std::wstring> sectionTitles;
             std::map<void*, int> originOrder;
             int currentOrder = 0;
+			if (sectionInputs) {
+				for (const auto& section : *sectionInputs) {
+					if (section.originWindow &&
+						originOrder.find(section.originWindow) == originOrder.end()) {
+						originOrder[section.originWindow] = currentOrder++;
+					}
+				}
+			}
 
             for (auto& ic : icons) {
                 void* targetWin = ic.originWindow ? ic.originWindow : containerWin;
@@ -617,35 +625,76 @@ namespace PoggetCore {
         }
 
         if (isIntegrated && !isInlineManager && !isSearchManager && sectionInputs) {
-            std::set<void*> representedOrigins;
-            int nextSectionY = startY;
-            for (const auto& header : outHeaders) {
-                representedOrigins.insert(header.originWindow);
-                nextSectionY = (std::max)(nextSectionY, header.y2 + 15);
-            }
-            for (const auto& icon : icons) {
+			std::map<void*, CoreSectionHeaderLayoutData> headersByOrigin;
+			int nextSectionY = startY;
+			for (const auto& header : outHeaders) {
+				headersByOrigin.emplace(header.originWindow, header);
+				nextSectionY = (std::max)(nextSectionY, header.y2 + 15);
+			}
+			for (const auto& icon : icons) {
                 if (!icon.isVisible || icon.isCollapsed || icon.targetY < -50.0f) continue;
                 void* targetWin = icon.originWindow ? icon.originWindow : containerWin;
                 nextSectionY = (std::max)(nextSectionY,
                     static_cast<int>(std::lround(icon.targetY)) +
-                    getAdjustedStep(targetWin));
-            }
-            for (const auto& section : *sectionInputs) {
-                if (!section.originWindow || representedOrigins.count(section.originWindow)) {
-                    continue;
-                }
-                CoreSectionHeaderLayoutData header;
-                header.originWindow = section.originWindow;
-                header.x1 = actualStartX + centeredOffsetX;
-                header.y1 = nextSectionY;
-                header.y2 = nextSectionY + 43;
-                header.x2 = containerWidth - (actualStartX + centeredOffsetX);
-                header.title = section.title.empty()
-                    ? getConfig(section.originWindow).title : section.title;
-                outHeaders.push_back(header);
-                representedOrigins.insert(section.originWindow);
-                nextSectionY += 58;
-            }
+					getAdjustedStep(targetWin));
+			}
+
+			std::vector<CoreSectionHeaderLayoutData> orderedHeaders;
+			orderedHeaders.reserve(sectionInputs->size());
+			std::map<void*, int> originOffsets;
+			int emptySectionsBefore = 0;
+			for (size_t sectionIndex = 0;
+				sectionIndex < sectionInputs->size(); ++sectionIndex) {
+				const auto& section = (*sectionInputs)[sectionIndex];
+				if (!section.originWindow) continue;
+				auto headerIt = headersByOrigin.find(section.originWindow);
+				if (headerIt != headersByOrigin.end()) {
+					CoreSectionHeaderLayoutData header = headerIt->second;
+					const int offset = emptySectionsBefore * 58;
+					header.y1 += offset;
+					header.y2 += offset;
+					orderedHeaders.push_back(header);
+					originOffsets[section.originWindow] = offset;
+					headersByOrigin.erase(headerIt);
+					continue;
+				}
+
+				int insertionY = nextSectionY + emptySectionsBefore * 58;
+				for (size_t followingIndex = sectionIndex + 1;
+					followingIndex < sectionInputs->size(); ++followingIndex) {
+					auto followingHeader = headersByOrigin.find(
+						(*sectionInputs)[followingIndex].originWindow);
+					if (followingHeader != headersByOrigin.end()) {
+						insertionY = followingHeader->second.y1 + emptySectionsBefore * 58;
+						break;
+					}
+				}
+				CoreSectionHeaderLayoutData header;
+				header.originWindow = section.originWindow;
+				header.x1 = actualStartX + centeredOffsetX;
+				header.y1 = insertionY;
+				header.y2 = insertionY + 43;
+				header.x2 = containerWidth - (actualStartX + centeredOffsetX);
+				header.title = section.title.empty()
+					? getConfig(section.originWindow).title : section.title;
+				orderedHeaders.push_back(header);
+				++emptySectionsBefore;
+			}
+
+			for (auto& icon : icons) {
+				void* targetWin = icon.originWindow ? icon.originWindow : containerWin;
+				auto offsetIt = originOffsets.find(targetWin);
+				if (offsetIt != originOffsets.end() && icon.targetY > -50.0f) {
+					icon.targetY += static_cast<float>(offsetIt->second);
+				}
+			}
+			for (const auto& remaining : headersByOrigin) {
+				CoreSectionHeaderLayoutData header = remaining.second;
+				header.y1 += emptySectionsBefore * 58;
+				header.y2 += emptySectionsBefore * 58;
+				orderedHeaders.push_back(header);
+			}
+			outHeaders = std::move(orderedHeaders);
         }
 
         if (pagedLayout) {

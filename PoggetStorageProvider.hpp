@@ -45,7 +45,7 @@ namespace PoggetCore {
 
 		// 保存 Storage，多分辨率兼容
 		// Save Storage, multi-resolution compatible
-        void SaveStorage();
+        bool SaveStorage();
 
         // 直接访问全局 VinaStorage 代理 用于过渡兼容
 		// Directly access the global VinaStorage proxy for transitional compatibility

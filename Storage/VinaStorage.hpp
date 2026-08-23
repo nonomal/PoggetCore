@@ -4,6 +4,10 @@
 
 #include "VinaBuilder.hpp" 
 #include "vui.parser.hpp" 
+#include "../tsl/ordered_map.h"
+#include <algorithm>
+#include <charconv>
+#include <codecvt>
 #include <variant>
 #include <string>
 #include <memory> 
@@ -15,8 +19,15 @@
 #include <cstring> 
 #include <any> 
 #include <atomic>
+#include <cstdint>
 #include <filesystem>
+#include <iomanip>
+#include <limits>
+#include <locale>
+#include <cmath>
+#include <cwctype>
 #include <mutex>
+#include <optional>
 
 #ifdef _WIN32
 #include <Windows.h>
@@ -39,155 +50,239 @@ struct VinaStorageNestedObject {
     VinaStorageObjectMap data;
 };
 
+enum class VinaStorageError {
+    none,
+    created,
+    recovered_backup,
+    invalid_argument,
+    not_loaded,
+    format_error,
+    resource_limit,
+    encoding_error,
+    io_error,
+    recovery_required,
+    conflict,
+    busy,
+    save_error
+};
+
+struct VinaStorageResult {
+    VinaStorageError error = VinaStorageError::none;
+    const char* message = "";
+
+    bool ok() const noexcept {
+        return error == VinaStorageError::none || error == VinaStorageError::created ||
+            error == VinaStorageError::recovered_backup;
+    }
+    explicit operator bool() const noexcept { return ok(); }
+};
+
 
 
 #ifdef _WIN32
 
+#ifndef WC_ERR_INVALID_CHARS
+#define WC_ERR_INVALID_CHARS 0x00000080
+#endif
+
+inline ULONGLONG VinaStorageTickCount() noexcept {
+#if defined(_WIN32_WINNT) && _WIN32_WINNT >= 0x0600
+    return GetTickCount64();
+#else
+    return static_cast<ULONGLONG>(GetTickCount());
+#endif
+}
+
+class VinaStorageProcessLock {
+public:
+    explicit VinaStorageProcessLock(const std::wstring& path) {
+        std::error_code ec;
+        std::wstring normalized_path = std::filesystem::absolute(path, ec)
+            .lexically_normal().wstring();
+        if (ec) normalized_path = path;
+
+        std::uint64_t hash = 1469598103934665603ULL;
+        for (wchar_t c : normalized_path) {
+            const wchar_t normalized = static_cast<wchar_t>(std::towlower(c));
+            hash ^= static_cast<std::uint64_t>(normalized);
+            hash *= 1099511628211ULL;
+        }
+        const std::wstring name = L"Local\\VinaStorage_" + std::to_wstring(hash);
+        handle_ = CreateMutexW(nullptr, FALSE, name.c_str());
+        if (!handle_) return;
+        const DWORD wait_result = WaitForSingleObject(handle_, 5000);
+        locked_ = wait_result == WAIT_OBJECT_0 || wait_result == WAIT_ABANDONED;
+    }
+
+    ~VinaStorageProcessLock() {
+        if (locked_) ReleaseMutex(handle_);
+        if (handle_) CloseHandle(handle_);
+    }
+
+    VinaStorageProcessLock(const VinaStorageProcessLock&) = delete;
+    VinaStorageProcessLock& operator=(const VinaStorageProcessLock&) = delete;
+    bool locked() const noexcept { return locked_; }
+
+private:
+    HANDLE handle_ = nullptr;
+    bool locked_ = false;
+};
+
+inline bool TryWStringToUTF8(const std::wstring& wstr, std::string& result) {
+    result.clear();
+    if (wstr.empty()) return true;
+    if (wstr.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) return false;
+
+    const int input_size = static_cast<int>(wstr.size());
+    const int size_needed = WideCharToMultiByte(
+        CP_UTF8, WC_ERR_INVALID_CHARS, wstr.data(), input_size, nullptr, 0, nullptr, nullptr);
+    if (size_needed <= 0) return false;
+
+    result.resize(static_cast<std::size_t>(size_needed));
+    const int converted = WideCharToMultiByte(
+        CP_UTF8, WC_ERR_INVALID_CHARS, wstr.data(), input_size,
+        result.data(), size_needed, nullptr, nullptr);
+    if (converted != size_needed) {
+        result.clear();
+        return false;
+    }
+    return true;
+}
+
 inline std::string WStringToUTF8(const std::wstring& wstr) {
-    if (wstr.empty()) return std::string();
-    // 计算需要的字节数
-    int size_needed = WideCharToMultiByte(CP_UTF8, 0, &wstr[0], (int)wstr.size(), NULL, 0, NULL, NULL);
-    if (size_needed <= 0) return std::string(); // 转换失败，防止崩溃
-    std::string strTo(size_needed, 0);
-    // 执行转换
-    int result = WideCharToMultiByte(CP_UTF8, 0, &wstr[0], (int)wstr.size(), &strTo[0], size_needed, NULL, NULL);
-    if (result <= 0) return std::string(); // 转换失败，防止崩溃
-    return strTo;
+    std::string result;
+    TryWStringToUTF8(wstr, result);
+    return result;
 }
 
 // 将 std::string (UTF-8) 转换为 std::wstring (UTF-16)
-inline std::wstring UTF8ToWString(const std::string& str) {
-    if (str.empty()) return std::wstring();
-    // 计算需要的宽字符数
-    int size_needed = MultiByteToWideChar(CP_UTF8, 0, &str[0], (int)str.size(), NULL, 0);
-    if (size_needed <= 0) return std::wstring(); // 转换失败，防止崩溃
-    std::wstring wstrTo(size_needed, 0);
-    // 执行转换
-    int result = MultiByteToWideChar(CP_UTF8, 0, &str[0], (int)str.size(), &wstrTo[0], size_needed);
-    if (result <= 0) return std::wstring(); // 转换失败，防止崩溃
-    return wstrTo;
-}
-#else
-// 在非 Windows 平台，假设 char/std::string 是 UTF-8，wstring 是 UTF-32 (或平台依赖)
-// 这里的实现将是错误的，但在您明确要求 Windows API 的前提下，我们只在 _WIN32 宏下使用。
-// 如果您需要在跨平台项目中使用，请使用 ICU 或 C++20 的 std::string_view::to_wstring 等。
-inline std::string WStringToUTF8(const std::wstring& wstr) {
-    // 假设非 Windows 平台可以简单进行转换 (不推荐用于生产环境)
-    std::string str(wstr.length(), ' ');
-    std::transform(wstr.begin(), wstr.end(), str.begin(),
-        [](wchar_t c) { return (char)c; });
-    return str;
+inline bool TryUTF8ToWString(const std::string& str, std::wstring& result) {
+    result.clear();
+    if (str.empty()) return true;
+    if (str.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) return false;
+
+    const int input_size = static_cast<int>(str.size());
+    const int size_needed = MultiByteToWideChar(
+        CP_UTF8, MB_ERR_INVALID_CHARS, str.data(), input_size, nullptr, 0);
+    if (size_needed <= 0) return false;
+
+    result.resize(static_cast<std::size_t>(size_needed));
+    const int converted = MultiByteToWideChar(
+        CP_UTF8, MB_ERR_INVALID_CHARS, str.data(), input_size, result.data(), size_needed);
+    if (converted != size_needed) {
+        result.clear();
+        return false;
+    }
+    return true;
 }
 
 inline std::wstring UTF8ToWString(const std::string& str) {
-    // 假设非 Windows 平台可以简单进行转换 (不推荐用于生产环境)
-    std::wstring wstr(str.length(), L' ');
-    std::transform(str.begin(), str.end(), wstr.begin(),
-        [](char c) { return (wchar_t)c; });
-    return wstr;
+    std::wstring result;
+    TryUTF8ToWString(str, result);
+    return result;
+}
+#else
+inline bool TryWStringToUTF8(const std::wstring& wstr, std::string& result) {
+    try {
+        std::wstring_convert<std::codecvt_utf8<wchar_t>, wchar_t> converter;
+        result = converter.to_bytes(wstr);
+        return true;
+    }
+    catch (const std::range_error&) {
+        result.clear();
+        return false;
+    }
+}
+
+inline bool TryUTF8ToWString(const std::string& str, std::wstring& result) {
+    try {
+        std::wstring_convert<std::codecvt_utf8<wchar_t>, wchar_t> converter;
+        result = converter.from_bytes(str);
+        return true;
+    }
+    catch (const std::range_error&) {
+        result.clear();
+        return false;
+    }
+}
+
+inline std::string WStringToUTF8(const std::wstring& wstr) {
+    std::string result;
+    TryWStringToUTF8(wstr, result);
+    return result;
+}
+
+inline std::wstring UTF8ToWString(const std::string& str) {
+    std::wstring result;
+    TryUTF8ToWString(str, result);
+    return result;
 }
 #endif
 
 // --- VinaStorage 类定义 ---
 class VinaStorage {
 private:
+    struct FileStamp {
+        bool exists = false;
+        std::uintmax_t size = 0;
+        std::filesystem::file_time_type write_time{};
+
+        bool operator==(const FileStamp& other) const noexcept {
+            return exists == other.exists && (!exists ||
+                (size == other.size && write_time == other.write_time));
+        }
+    };
+
     std::wstring filename_;
     std::wstring backup_path_;
     // 根对象列表也改为有序 Map，以保持多个根对象的顺序
     tsl::ordered_map<std::wstring, VinaStorageObjectMap> root_objects_;
     bool loaded_ = false; // Add a flag to track if file is loaded
-    std::mutex io_mutex_;
+    bool writable_ = false;
+    mutable std::mutex io_mutex_;
+    VinaStorageError state_error_ = VinaStorageError::none;
+    vui::parser::parser_limits parser_limits_{};
+    vui::parser::parser_error parser_error_ = vui::parser::parser_error::none;
+    VinaStorageError load_error_ = VinaStorageError::none;
+    std::optional<FileStamp> loaded_stamp_;
+    std::atomic<std::uint64_t> mutation_generation_{ 0 };
+    std::uint64_t saved_generation_ = 0;
+    mutable std::atomic_bool mutation_tracking_uncertain_{ false };
+
+    static FileStamp getFileStamp(const std::wstring& filename) {
+        FileStamp stamp;
+        std::error_code ec;
+        const std::filesystem::path path(filename);
+        stamp.exists = std::filesystem::is_regular_file(path, ec);
+        if (ec || !stamp.exists) return stamp;
+        stamp.size = std::filesystem::file_size(path, ec);
+        if (ec) return FileStamp{};
+        stamp.write_time = std::filesystem::last_write_time(path, ec);
+        if (ec) return FileStamp{};
+        return stamp;
+    }
+
+    void markMutated() noexcept {
+        mutation_generation_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void markMutationTrackingUncertain() const noexcept {
+        mutation_tracking_uncertain_.store(true, std::memory_order_relaxed);
+    }
 
     // ... (convertBasicObjectToMap, isEscapedPath, hasMultipleConsecutiveBackslashes, populateVinaObject 保持不变) ...
     // 为了保持您提供的代码的完整性和结构，我将这些函数体粘贴在下面
 
     // START: 保持不变的代码片段
 
-    VinaStorageObjectMap convertBasicObjectToMap(vui::parser::basic_object<wchar_t>& basic_obj) {
+    VinaStorageObjectMap convertBasicObjectToMap(const vui::parser::basic_object<wchar_t>& basic_obj) {
         VinaStorageObjectMap converted_map;
 
-        auto it = basic_obj.begin();
-        auto end_it = basic_obj.end();
-
-        for (; it != end_it; ++it) {
-            auto& pair = *it;
-            std::wstring key = pair.name();
-            std::any value_any = basic_obj[key];
+        for (const std::wstring& key : basic_obj.order()) {
+            const std::any& value_any = basic_obj[key];
 
             if (value_any.type() == typeid(std::wstring)) {
-                // --- 修复开始：处理字符串中的 bool 和换行符问题 ---
-                std::wstring val_str = std::any_cast<std::wstring>(value_any);
-
-                // 1. 去除首尾空白字符（包括换行符 \n, \r, 空格, 制表符）
-                const std::wstring whitespace = L" \t\n\r";
-                size_t start = val_str.find_first_not_of(whitespace);
-                if (start != std::wstring::npos) {
-                    size_t end = val_str.find_last_not_of(whitespace);
-                    val_str = val_str.substr(start, end - start + 1);
-                }
-                else {
-                    val_str = L""; // 全是空白
-                }
-
-                // 2. 尝试还原 bool 类型
-                if (val_str == L"true") {
-                    converted_map[key] = true;
-                }
-                else if (val_str == L"false") {
-                    converted_map[key] = false;
-                }
-                else {
-                    // --- 修复：尝试还原 int 类型 (解决 test : "0" 问题) ---
-                    bool is_int_str = true;
-                    if (val_str.empty() || val_str.find(L'.') != std::wstring::npos) { // 排除空字符串和浮点数
-                        is_int_str = false;
-                    }
-                    else {
-                        size_t idx = 0;
-                        // 检查可选的负号
-                        if (val_str[0] == L'-') {
-                            if (val_str.length() == 1) { // 只有负号 "-"
-                                is_int_str = false;
-                            }
-                            else {
-                                idx = 1;
-                            }
-                        }
-
-                        // 检查其余字符是否都是数字
-                        if (is_int_str) {
-                            // 必须至少有一个数字
-                            if (val_str.length() <= idx) {
-                                is_int_str = false;
-                            }
-                            else {
-                                for (; idx < val_str.length(); ++idx) {
-                                    if (val_str[idx] < L'0' || val_str[idx] > L'9') {
-                                        is_int_str = false;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    if (is_int_str) {
-                        try {
-                            // 使用 std::stoi 将数字字符串转换为 int
-                            converted_map[key] = std::stoi(val_str);
-                        }
-                        catch (...) {
-                            // 转换失败（例如数字过大溢出），保留为字符串
-                            converted_map[key] = val_str;
-                        }
-                    }
-                    else {
-                        // 不是 bool，不是纯整数，保留为字符串
-                        converted_map[key] = val_str;
-                    }
-                    // --- 修复结束 ---
-                }
-                // --- 修复结束 ---
+                converted_map[key] = std::any_cast<const std::wstring&>(value_any);
             }
             else if (value_any.type() == typeid(int)) {
                 converted_map[key] = std::any_cast<int>(value_any);
@@ -199,7 +294,8 @@ private:
                 converted_map[key] = std::any_cast<bool>(value_any);
             }
             else if (value_any.type() == typeid(vui::parser::basic_object<wchar_t>)) {
-                auto nested_basic_obj = std::any_cast<vui::parser::basic_object<wchar_t>>(value_any);
+                const auto& nested_basic_obj =
+                    std::any_cast<const vui::parser::basic_object<wchar_t>&>(value_any);
                 auto nested_map = convertBasicObjectToMap(nested_basic_obj);
                 auto nested_obj_ptr = std::make_shared<VinaStorageNestedObject>();
                 nested_obj_ptr->data = std::move(nested_map);
@@ -281,11 +377,67 @@ private:
         return false;
     }
 
+    static bool isSyntaxWhitespace(wchar_t c) noexcept {
+        return c == L' ' || c == L'\t' || c == L'\n' || c == L'\r' || c == L'\f' || c == L'\v';
+    }
+
+    static bool isValidObjectName(const std::wstring& name) noexcept {
+        if (name.empty() || name.front() == L'@' || isSyntaxWhitespace(name.front()) ||
+            isSyntaxWhitespace(name.back())) {
+            return false;
+        }
+        return name.find(L'{') == std::wstring::npos && name.find(L'^') == std::wstring::npos;
+    }
+
+    static bool isValidMemberName(const std::wstring& name) noexcept {
+        if (name.empty()) return false;
+        for (wchar_t c : name) {
+            if (isSyntaxWhitespace(c) || c == L'(' || c == L':' || c == L'{' ||
+                c == L',' || c == L'}') {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static std::wstring formatDouble(double value) {
+        char buffer[64]{};
+        const auto converted = std::to_chars(
+            buffer, buffer + sizeof(buffer), value, std::chars_format::general);
+        if (converted.ec != std::errc{}) {
+            throw std::runtime_error("Could not format floating-point value.");
+        }
+        std::wstring result;
+        result.reserve(static_cast<std::size_t>(converted.ptr - buffer) + 2);
+        for (const char* p = buffer; p != converted.ptr; ++p) {
+            result.push_back(static_cast<wchar_t>(*p));
+        }
+        if (result.find_first_of(L".eE") == std::wstring::npos) result += L".0";
+        return result;
+    }
+
+    static double normalizeFloat(float value) {
+        if (!std::isfinite(value)) return static_cast<double>(value);
+        char buffer[64]{};
+        const auto written = std::to_chars(
+            buffer, buffer + sizeof(buffer), value, std::chars_format::general);
+        if (written.ec != std::errc{}) return static_cast<double>(value);
+        double normalized = 0.0;
+        const auto parsed = std::from_chars(buffer, written.ptr, normalized, std::chars_format::general);
+        return parsed.ec == std::errc{} && parsed.ptr == written.ptr
+            ? normalized : static_cast<double>(value);
+    }
+
     void populateVinaObject(VinaObject* vina_obj, const VinaStorageObjectMap& data_map) {
         // 由于 data_map 现在是 tsl::ordered_map，迭代顺序将严格按照文件中的顺序
         for (const auto& item : data_map) {
             const std::wstring& key = item.first;
             const VinaStorageValue& value_variant = item.second;
+
+            if (!isValidMemberName(key)) {
+                throw std::runtime_error("Storage member name contains unsupported syntax characters: " +
+                    WStringToUTF8(key));
+            }
 
             std::visit([vina_obj, &key, this](auto&& val) {
                 using T = std::decay_t<decltype(val)>;
@@ -293,39 +445,31 @@ private:
                     vina_obj->AddData(key, std::to_wstring(val));
                 }
                 else if constexpr (std::is_same_v<T, double>) {
-                    // 使用足够精度保证 double 写入后能正确读回
-                    std::wstringstream ws;
-                    ws << val;
-                    vina_obj->AddData(key, ws.str());
+                    if (!std::isfinite(val)) {
+                        throw std::runtime_error("Storage does not support non-finite floating-point values.");
+                    }
+                    vina_obj->AddData(key, formatDouble(val));
                 }
                 else if constexpr (std::is_same_v<T, bool>) {
                     vina_obj->AddData(key, val ? L"true" : L"false");
                 }
                 else if constexpr (std::is_same_v<T, std::wstring>) {
-                    std::wstring val_str = val; // 获取内存中的字面值
-
                     std::wstring escaped_val;
-
-                    // 始终对字符串内容进行转义并添加引号
-                    // 不再跳过含连续反斜杠的字符串，防止 Load->Save->Load 数据不一致
-                    // 预留转义后的空间，至少 (length + 2 for quotes)
-                    escaped_val.reserve(val_str.length() * 2 + 2);
-
-                    for (wchar_t c : val_str) {
+                    escaped_val.reserve(val.length() * 2 + 2);
+                    escaped_val += L'"';
+                    for (wchar_t c : val) {
                         if (c == L'\\') {
-                            escaped_val += L"\\\\"; // 遇到字面值 '\' 转换为 '\\' (写入文件时正确)
+                            escaped_val += L"\\\\";
                         }
-                        else if (c == L'"') { // 增加对双引号的转义
+                        else if (c == L'"') {
                             escaped_val += L"\\\"";
                         }
                         else {
                             escaped_val += c;
                         }
                     }
-
-                    // 对于正常的字符串内容，加上引号并使用转义后的字符串
-                    vina_obj->AddData(key, L"\"" + escaped_val + L"\"");
-
+                    escaped_val += L'"';
+                    vina_obj->AddData(key, escaped_val);
                 }
                 else if constexpr (std::is_same_v<T, std::shared_ptr<VinaStorageNestedObject>>) {
                     if (val) {
@@ -339,37 +483,69 @@ private:
 
 private:
     bool LoadInternal(const std::wstring& filename) {
-#ifdef _WIN32
-        std::ifstream file_stream(filename);
+        load_error_ = VinaStorageError::io_error;
+        std::ifstream file_stream{
+            std::filesystem::path(filename), std::ios::in | std::ios::binary | std::ios::ate
+        };
         if (!file_stream.is_open()) {
             return false;
         }
 
-        std::stringstream buffer;
-        buffer << file_stream.rdbuf();
-        std::string utf8_content = buffer.str();
-        std::wstring wcontent = UTF8ToWString(utf8_content);
+        const std::streamoff file_size = file_stream.tellg();
+        if (file_size < 0 ||
+            static_cast<std::uintmax_t>(file_size) > std::numeric_limits<std::size_t>::max() ||
+            static_cast<std::uintmax_t>(file_size) > static_cast<std::uintmax_t>(std::numeric_limits<std::streamsize>::max())) {
+            return false;
+        }
+        if (parser_limits_.max_input_bytes != 0 &&
+            static_cast<std::uintmax_t>(file_size) > parser_limits_.max_input_bytes) {
+            load_error_ = VinaStorageError::resource_limit;
+            return false;
+        }
+
+        std::string utf8_content(static_cast<std::size_t>(file_size), '\0');
+        file_stream.seekg(0, std::ios::beg);
+        if (!utf8_content.empty() &&
+            !file_stream.read(utf8_content.data(), static_cast<std::streamsize>(utf8_content.size()))) {
+            return false;
+        }
+        if (utf8_content.size() >= 3 &&
+            static_cast<unsigned char>(utf8_content[0]) == 0xEF &&
+            static_cast<unsigned char>(utf8_content[1]) == 0xBB &&
+            static_cast<unsigned char>(utf8_content[2]) == 0xBF) {
+            utf8_content.erase(0, 3);
+        }
+
+        std::wstring wcontent;
+        if (!TryUTF8ToWString(utf8_content, wcontent)) {
+            load_error_ = VinaStorageError::encoding_error;
+            return false;
+        }
+        if (std::all_of(wcontent.begin(), wcontent.end(), isSyntaxWhitespace)) {
+            root_objects_.clear();
+            return true;
+        }
         std::wstringstream wide_stream(wcontent);
         vui::parser::basic_parser<std::wstringstream, wchar_t> parser(std::move(wide_stream));
-#else
-        std::wfstream file_stream(filename, std::ios::in);
-        if (!file_stream.is_open()) {
-            return false;
-        }
-        vui::parser::basic_parser<std::wfstream, wchar_t> parser(std::move(file_stream));
-#endif
+        parser.set_limits(parser_limits_);
 
         if (!parser.parse()) {
+            parser_error_ = parser.error();
+            load_error_ = parser_error_ == vui::parser::parser_error::resource_limit
+                ? VinaStorageError::resource_limit : VinaStorageError::format_error;
             return false;
         }
+        parser_error_ = vui::parser::parser_error::none;
 
-        root_objects_.clear();
+        tsl::ordered_map<std::wstring, VinaStorageObjectMap> parsed_objects;
         for (auto parsed_root_obj : parser) {
             std::wstring obj_name = parsed_root_obj.name();
             VinaStorageObjectMap converted_map = convertBasicObjectToMap(parsed_root_obj);
-            root_objects_[obj_name] = converted_map;
+            parsed_objects[obj_name] = std::move(converted_map);
         }
 
+        root_objects_ = std::move(parsed_objects);
+        load_error_ = VinaStorageError::none;
         return true;
     }
 
@@ -378,7 +554,74 @@ public:
 
     VinaStorage() : filename_(L""), loaded_(false) {}
 
+    void SetLimits(vui::parser::parser_limits limits) {
+        std::lock_guard<std::mutex> lock(io_mutex_);
+        parser_limits_ = limits;
+    }
+
+    vui::parser::parser_limits GetLimits() const {
+        std::lock_guard<std::mutex> lock(io_mutex_);
+        return parser_limits_;
+    }
+
+    VinaStorageError LastError() const {
+        std::lock_guard<std::mutex> lock(io_mutex_);
+        return state_error_;
+    }
+
+    VinaStorageResult TryLoad(const std::wstring& filename) noexcept {
+        try {
+            Load(filename);
+            return { state_error_, "" };
+        }
+        catch (const std::bad_alloc&) {
+            state_error_ = VinaStorageError::resource_limit;
+            loaded_ = false;
+            writable_ = false;
+            return { VinaStorageError::resource_limit, "Storage load ran out of memory." };
+        }
+        catch (const std::exception& e) {
+            (void)e;
+            if (state_error_ == VinaStorageError::none) {
+                state_error_ = VinaStorageError::recovery_required;
+            }
+            loaded_ = false;
+            writable_ = false;
+            return { state_error_, "Storage load failed; inspect the error code and source files." };
+        }
+        catch (...) {
+            state_error_ = VinaStorageError::recovery_required;
+            loaded_ = false;
+            writable_ = false;
+            return { VinaStorageError::recovery_required, "Unknown storage load failure." };
+        }
+    }
+
+    VinaStorageResult TrySave() noexcept {
+        try {
+            Save();
+            return { VinaStorageError::none, "" };
+        }
+        catch (const std::bad_alloc&) {
+            state_error_ = VinaStorageError::resource_limit;
+            return { VinaStorageError::resource_limit, "Storage save ran out of memory." };
+        }
+        catch (const std::exception& e) {
+            (void)e;
+            if (state_error_ != VinaStorageError::conflict && state_error_ != VinaStorageError::busy &&
+                state_error_ != VinaStorageError::not_loaded) {
+                state_error_ = VinaStorageError::save_error;
+            }
+            return { state_error_, "Storage save failed; existing files were not overwritten." };
+        }
+        catch (...) {
+            state_error_ = VinaStorageError::save_error;
+            return { VinaStorageError::save_error, "Unknown storage save failure." };
+        }
+    }
+
     void SetBackupPath(const std::wstring& backup_path) {
+        std::lock_guard<std::mutex> lock(io_mutex_);
         backup_path_ = backup_path;
     }
 
@@ -386,6 +629,14 @@ public:
         std::lock_guard<std::mutex> io_lock(io_mutex_);
         filename_ = filename;
         loaded_ = false;
+        writable_ = false;
+        state_error_ = VinaStorageError::none;
+        load_error_ = VinaStorageError::none;
+
+        if (filename.empty()) {
+            state_error_ = VinaStorageError::invalid_argument;
+            throw std::invalid_argument("Storage filename cannot be empty.");
+        }
 
         const std::wstring backup_filename =
             backup_path_.empty() ? (filename + L".bak") : backup_path_;
@@ -393,15 +644,19 @@ public:
         // Check if primary file exists
 #ifdef _WIN32
         DWORD dwAttrs = GetFileAttributesW(filename.c_str());
+        if (dwAttrs != INVALID_FILE_ATTRIBUTES && (dwAttrs & FILE_ATTRIBUTE_DIRECTORY)) {
+            state_error_ = VinaStorageError::invalid_argument;
+            throw std::invalid_argument("Storage path refers to a directory.");
+        }
         bool file_exists = (dwAttrs != INVALID_FILE_ATTRIBUTES && !(dwAttrs & FILE_ATTRIBUTE_DIRECTORY));
         DWORD dwBackupAttrs = GetFileAttributesW(backup_filename.c_str());
         bool backup_exists =
             (dwBackupAttrs != INVALID_FILE_ATTRIBUTES && !(dwBackupAttrs & FILE_ATTRIBUTE_DIRECTORY));
 #else
-        std::wifstream file_check(filename);
+        std::ifstream file_check(std::filesystem::path(filename), std::ios::binary);
         bool file_exists = file_check.good();
         file_check.close();
-        std::wifstream backup_check(backup_filename);
+        std::ifstream backup_check(std::filesystem::path(backup_filename), std::ios::binary);
         bool backup_exists = backup_check.good();
         backup_check.close();
 #endif
@@ -409,38 +664,80 @@ public:
         if (!file_exists) {
             if (backup_exists && LoadInternal(backup_filename)) {
                 loaded_ = true;
+                writable_ = false;
+                state_error_ = VinaStorageError::recovered_backup;
                 std::wcout << L"VinaStorage primary file was missing; loaded backup '"
                     << backup_filename << L"'." << std::endl;
 #ifdef _WIN32
                 static std::atomic<unsigned long long> missing_restore_sequence{ 0 };
                 const std::wstring restore_temp = filename + L".restore." +
                     std::to_wstring(GetCurrentProcessId()) + L"." +
-                    std::to_wstring(GetTickCount64()) + L"." +
+                    std::to_wstring(VinaStorageTickCount()) + L"." +
                     std::to_wstring(++missing_restore_sequence);
                 if (CopyFileW(backup_filename.c_str(), restore_temp.c_str(), TRUE)) {
                     if (!MoveFileExW(restore_temp.c_str(), filename.c_str(),
                             MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
                         DeleteFileW(restore_temp.c_str());
                     }
+                    else {
+                        writable_ = true;
+                    }
                 }
 #else
-                std::ifstream src(backup_filename, std::ios::binary);
-                std::ofstream dst(filename, std::ios::binary | std::ios::trunc);
+                std::ifstream src(std::filesystem::path(backup_filename), std::ios::binary);
+                std::ofstream dst(std::filesystem::path(filename), std::ios::binary | std::ios::trunc);
                 dst << src.rdbuf();
+                writable_ = src.good() && dst.good();
 #endif
+                loaded_stamp_ = getFileStamp(filename);
+                mutation_generation_.store(0, std::memory_order_relaxed);
+                saved_generation_ = 0;
+                mutation_tracking_uncertain_.store(false, std::memory_order_relaxed);
+                if (!writable_) {
+                    state_error_ = VinaStorageError::recovery_required;
+                    throw std::runtime_error("Backup loaded, but the primary file could not be restored safely.");
+                }
                 return;
+            }
+            if (backup_exists) {
+                state_error_ = load_error_ == VinaStorageError::resource_limit
+                    ? VinaStorageError::resource_limit : VinaStorageError::recovery_required;
+                loaded_ = false;
+                writable_ = false;
+                throw std::runtime_error(
+                    "Storage primary is missing and the existing backup could not be loaded safely.");
             }
             std::wcout << L"Info: File '" << filename << L"' does not exist. Creating new storage." << std::endl;
             root_objects_.clear();
             loaded_ = true;
+            writable_ = true;
+            state_error_ = VinaStorageError::created;
+            loaded_stamp_ = getFileStamp(filename);
+            mutation_generation_.store(0, std::memory_order_relaxed);
+            saved_generation_ = 0;
+            mutation_tracking_uncertain_.store(false, std::memory_order_relaxed);
             return;
         }
 
         // Try loading primary file
         if (LoadInternal(filename)) {
             loaded_ = true;
+            writable_ = true;
+            state_error_ = VinaStorageError::none;
+            loaded_stamp_ = getFileStamp(filename);
+            mutation_generation_.store(0, std::memory_order_relaxed);
+            saved_generation_ = 0;
+            mutation_tracking_uncertain_.store(false, std::memory_order_relaxed);
             std::wcout << L"VinaStorage loaded from '" << filename << L"' (" << root_objects_.size() << L" root objects)." << std::endl;
             return;
+        }
+
+        const VinaStorageError primary_error = load_error_;
+        if (primary_error != VinaStorageError::format_error &&
+            primary_error != VinaStorageError::encoding_error) {
+            state_error_ = primary_error == VinaStorageError::resource_limit
+                ? VinaStorageError::resource_limit : VinaStorageError::recovery_required;
+            throw std::runtime_error("Storage primary file could not be read safely; retry is required.");
         }
 
         // If primary file failed to load, try backup file
@@ -448,6 +745,8 @@ public:
             std::wcerr << L"Warning: Failed to load primary file '" << filename << L"'. Attempting to restore from backup '" << backup_filename << L"'." << std::endl;
             if (LoadInternal(backup_filename)) {
                 loaded_ = true;
+                writable_ = false;
+                state_error_ = VinaStorageError::recovered_backup;
                 std::wcout << L"VinaStorage successfully restored and loaded from backup." << std::endl;
                 
                 // Copy backup back to primary file to fix it
@@ -455,36 +754,64 @@ public:
                 static std::atomic<unsigned long long> restore_sequence{ 0 };
                 const std::wstring restore_temp = filename + L".restore." +
                     std::to_wstring(GetCurrentProcessId()) + L"." +
-                    std::to_wstring(GetTickCount64()) + L"." +
+                    std::to_wstring(VinaStorageTickCount()) + L"." +
                     std::to_wstring(++restore_sequence);
                 if (CopyFileW(backup_filename.c_str(), restore_temp.c_str(), TRUE)) {
-                    if (!MoveFileExW(restore_temp.c_str(), filename.c_str(),
-                            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+                    static std::atomic<unsigned long long> recovery_artifact_sequence{ 0 };
+                    std::wstring recovery_artifact = filename + L".corrupted";
+                    if (GetFileAttributesW(recovery_artifact.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                        recovery_artifact += L"." + std::to_wstring(VinaStorageTickCount()) + L"." +
+                            std::to_wstring(++recovery_artifact_sequence);
+                    }
+                    if (!ReplaceFileW(filename.c_str(), restore_temp.c_str(), recovery_artifact.c_str(),
+                            REPLACEFILE_WRITE_THROUGH, nullptr, nullptr)) {
                         DeleteFileW(restore_temp.c_str());
+                    }
+                    else {
+                        writable_ = true;
                     }
                 }
 #else
-                std::ifstream src(backup_filename, std::ios::binary);
-                std::ofstream dst(filename, std::ios::binary);
+                std::ifstream src(std::filesystem::path(backup_filename), std::ios::binary);
+                std::ofstream dst(std::filesystem::path(filename), std::ios::binary | std::ios::trunc);
                 dst << src.rdbuf();
+                writable_ = src.good() && dst.good();
 #endif
+                loaded_stamp_ = getFileStamp(filename);
+                mutation_generation_.store(0, std::memory_order_relaxed);
+                saved_generation_ = 0;
+                mutation_tracking_uncertain_.store(false, std::memory_order_relaxed);
+                if (!writable_) {
+                    state_error_ = VinaStorageError::recovery_required;
+                    throw std::runtime_error("Backup loaded, but the primary file could not be restored safely.");
+                }
                 return;
             }
         }
 
-        // If both failed or backup doesn't exist, we rename the corrupted file to .corrupted,
-        // and then load an empty configuration to prevent crash.
-        std::wcerr << L"Error: Failed to load both primary and backup storage files for '" << filename << L"'. Resetting to empty configuration." << std::endl;
+        // Do not overwrite or rename files after an I/O/resource failure. Only definite
+        // format/encoding corruption is preserved as a .corrupted artifact.
+        std::wcerr << L"Error: Failed to load both primary and backup storage files for '" << filename
+            << L"'. Preserving the damaged primary for manual recovery." << std::endl;
+
+        if (load_error_ != VinaStorageError::format_error && load_error_ != VinaStorageError::encoding_error) {
+            state_error_ = load_error_ == VinaStorageError::resource_limit
+                ? VinaStorageError::resource_limit : VinaStorageError::recovery_required;
+            loaded_ = false;
+            writable_ = false;
+            throw std::runtime_error("Storage could not be read safely; manual recovery or retry is required.");
+        }
         
         std::wstring corrupted_filename = filename + L".corrupted";
 #ifdef _WIN32
         static std::atomic<unsigned long long> corrupted_sequence{ 0 };
         if (GetFileAttributesW(corrupted_filename.c_str()) != INVALID_FILE_ATTRIBUTES) {
-            corrupted_filename += L"." + std::to_wstring(GetTickCount64()) + L"." +
+            corrupted_filename += L"." + std::to_wstring(VinaStorageTickCount()) + L"." +
                 std::to_wstring(++corrupted_sequence);
         }
         if (!MoveFileExW(filename.c_str(), corrupted_filename.c_str(), MOVEFILE_WRITE_THROUGH)) {
             loaded_ = false;
+            writable_ = false;
             throw std::runtime_error(
                 "Could not preserve corrupted storage before reset (Error code: " +
                 std::to_string(GetLastError()) + ")");
@@ -494,38 +821,78 @@ public:
 #endif
 
         root_objects_.clear();
-        loaded_ = true;
+        state_error_ = VinaStorageError::recovery_required;
+        loaded_ = false;
+        writable_ = false;
+        throw std::runtime_error(
+            "Storage primary and backup files are unusable; manual recovery is required.");
     }
 
     // Check if a file is currently loaded
     bool IsLoaded() const {
+        std::lock_guard<std::mutex> lock(io_mutex_);
         return loaded_;
+    }
+
+    bool IsWritable() const {
+        std::lock_guard<std::mutex> lock(io_mutex_);
+        return loaded_ && writable_;
     }
 
     // Save
     void Save() {
         std::lock_guard<std::mutex> io_lock(io_mutex_);
-        if (!loaded_ || filename_.empty()) {
-            throw std::runtime_error("Cannot save: No file is currently loaded or filename is not set.");
+        if (!loaded_ || !writable_ || filename_.empty()) {
+            state_error_ = VinaStorageError::not_loaded;
+            throw std::runtime_error("Cannot save: No writable storage is currently loaded.");
+        }
+        const std::uint64_t generation = mutation_generation_.load(std::memory_order_relaxed);
+        if (loaded_stamp_.has_value() && !(getFileStamp(filename_) == loaded_stamp_.value())) {
+            state_error_ = VinaStorageError::conflict;
+            throw std::runtime_error("Storage file changed externally; refusing to overwrite it.");
+        }
+        if (generation == saved_generation_ &&
+            !mutation_tracking_uncertain_.load(std::memory_order_relaxed) &&
+            loaded_stamp_.has_value() && loaded_stamp_->exists) {
+            state_error_ = VinaStorageError::none;
+            return;
+        }
+
+#ifdef _WIN32
+        VinaStorageProcessLock process_lock(filename_);
+        if (!process_lock.locked()) {
+            state_error_ = VinaStorageError::busy;
+            throw std::runtime_error("Storage is busy in another process.");
+        }
+#endif
+        if (loaded_stamp_.has_value() && !(getFileStamp(filename_) == loaded_stamp_.value())) {
+            state_error_ = VinaStorageError::conflict;
+            throw std::runtime_error("Storage file changed externally; refusing to overwrite it.");
         }
 
         VinaBuilder builder;
 
         // Iteration over root_objects_ is now ordered as well
         for (const auto& [obj_name, obj_data] : root_objects_) {
+            if (!isValidObjectName(obj_name)) {
+                throw std::runtime_error("Storage object name contains unsupported syntax characters: " +
+                    WStringToUTF8(obj_name));
+            }
             VinaObject* root_obj = builder.AddObject(obj_name);
             populateVinaObject(root_obj, obj_data);
         }
 
         std::wstring wcontent = builder.GetContent();
+        std::string utf8_content;
+        if (!TryWStringToUTF8(wcontent, utf8_content)) {
+            throw std::runtime_error("Storage contains text that cannot be encoded as valid UTF-8.");
+        }
 
 #ifdef _WIN32
-        std::string utf8_content = WStringToUTF8(wcontent);
-
         static std::atomic<unsigned long long> save_sequence{ 0 };
         std::wstring temp_filename = filename_ + L".tmp." +
             std::to_wstring(GetCurrentProcessId()) + L"." +
-            std::to_wstring(GetTickCount64()) + L"." +
+            std::to_wstring(VinaStorageTickCount()) + L"." +
             std::to_wstring(++save_sequence);
         std::wstring backup_filename = backup_path_.empty() ? (filename_ + L".bak") : backup_path_;
 
@@ -543,33 +910,39 @@ public:
             throw std::runtime_error("Storage primary and backup paths must be different.");
         }
 
-        // 1. Ensure parent directory of backup_filename exists
-        {
-            std::filesystem::path p(backup_filename);
+        // 1. Ensure parent directories exist before creating the temp or backup files.
+        const auto ensure_parent_directory = [](const std::wstring& path, const char* description) {
+            std::filesystem::path p(path);
             std::error_code ec;
             if (!p.parent_path().empty()) {
                 std::filesystem::create_directories(p.parent_path(), ec);
                 if (ec) {
-                    throw std::runtime_error("Could not create storage backup directory: " +
+                    throw std::runtime_error(std::string("Could not create storage ") + description + " directory: " +
                         WStringToUTF8(p.parent_path().wstring()));
                 }
             }
-        }
+        };
+        ensure_parent_directory(filename_, "primary");
+        ensure_parent_directory(backup_filename, "backup");
 
         // 2. Write content to temp file
+        bool write_ok = false;
         {
-            std::ofstream file_stream(temp_filename, std::ios::out | std::ios::binary);
+            std::ofstream file_stream{
+                std::filesystem::path(temp_filename), std::ios::out | std::ios::binary
+            };
             if (!file_stream.is_open()) {
                 std::string filename_utf8 = WStringToUTF8(temp_filename);
                 throw std::runtime_error("Could not open temp file for writing: " + filename_utf8);
             }
-            file_stream << utf8_content;
+            file_stream.write(utf8_content.data(), static_cast<std::streamsize>(utf8_content.size()));
             file_stream.flush();
-            if (!file_stream.good()) {
-                std::string filename_utf8 = WStringToUTF8(temp_filename);
-                throw std::runtime_error("Error writing to temp file: " + filename_utf8);
-            }
+            write_ok = file_stream.good();
         } // file_stream closed here
+        if (!write_ok) {
+            DeleteFileW(temp_filename.c_str());
+            throw std::runtime_error("Error writing to temp file: " + WStringToUTF8(temp_filename));
+        }
 
         // 3. Flush OS file buffers to physical storage to prevent data loss on power cut / forced shutdown
         HANDLE hFile = CreateFileW(
@@ -596,6 +969,14 @@ public:
             DeleteFileW(temp_filename.c_str());
             throw std::runtime_error("Could not reopen storage temp file for flush (Error code: " +
                 std::to_string(open_error) + ")");
+        }
+
+        // Serialization and temp-file I/O can take time for large stores. Recheck
+        // immediately before replacement so an external edit is not overwritten.
+        if (loaded_stamp_.has_value() && !(getFileStamp(filename_) == loaded_stamp_.value())) {
+            DeleteFileW(temp_filename.c_str());
+            state_error_ = VinaStorageError::conflict;
+            throw std::runtime_error("Storage file changed while saving; refusing to overwrite it.");
         }
 
         // 4. Atomically replace the original file with retry loop for anti-virus/sync locks
@@ -639,7 +1020,7 @@ public:
             if (original_exists) {
                 const std::wstring backup_temp = backup_filename + L".tmp." +
                     std::to_wstring(GetCurrentProcessId()) + L"." +
-                    std::to_wstring(GetTickCount64()) + L"." +
+                    std::to_wstring(VinaStorageTickCount()) + L"." +
                     std::to_wstring(++save_sequence);
                 if (!CopyFileW(filename_.c_str(), backup_temp.c_str(), TRUE)) {
                     const DWORD backup_error = GetLastError();
@@ -685,32 +1066,64 @@ public:
         }
 #else
         // Non-Windows platform fallback
-        std::wstring temp_filename = filename_ + L".tmp";
-        std::wstring backup_filename = backup_path_.empty() ? (filename_ + L".bak") : backup_path_;
+        static std::atomic<unsigned long long> save_sequence{ 0 };
+        const std::wstring temp_filename = filename_ + L".tmp." +
+            std::to_wstring(++save_sequence);
+        const std::wstring backup_filename = backup_path_.empty() ? (filename_ + L".bak") : backup_path_;
 
-        // Ensure parent directory exists
-        {
-            std::filesystem::path p(backup_filename);
+        const auto ensure_parent_directory = [](const std::filesystem::path& path) {
+            if (path.parent_path().empty()) return;
             std::error_code ec;
-            std::filesystem::create_directories(p.parent_path(), ec);
+            std::filesystem::create_directories(path.parent_path(), ec);
+            if (ec) throw std::runtime_error("Could not create storage directory: " + ec.message());
+        };
+        const std::filesystem::path primary_path(filename_);
+        const std::filesystem::path backup_file_path(backup_filename);
+        const std::filesystem::path temp_path(temp_filename);
+        ensure_parent_directory(primary_path);
+        ensure_parent_directory(backup_file_path);
+
+        {
+            std::ofstream output(temp_path, std::ios::binary | std::ios::trunc);
+            if (!output.is_open()) throw std::runtime_error("Could not open storage temp file.");
+            output.write(utf8_content.data(), static_cast<std::streamsize>(utf8_content.size()));
+            output.flush();
+            if (!output.good()) {
+                std::error_code cleanup_ec;
+                std::filesystem::remove(temp_path, cleanup_ec);
+                throw std::runtime_error("Could not write storage temp file.");
+            }
         }
 
-        if (!builder.SaveToFile(temp_filename)) {
-            throw std::runtime_error("Could not save to temp file: " + std::string(temp_filename.begin(), temp_filename.end()));
+        if (loaded_stamp_.has_value() && !(getFileStamp(filename_) == loaded_stamp_.value())) {
+            std::error_code cleanup_ec;
+            std::filesystem::remove(temp_path, cleanup_ec);
+            state_error_ = VinaStorageError::conflict;
+            throw std::runtime_error("Storage file changed while saving; refusing to overwrite it.");
         }
 
-        // Create backup of old file if it exists
-        std::wifstream check(filename_);
-        if (check.good()) {
-            check.close();
-            std::rename(WStringToUTF8(filename_).c_str(), WStringToUTF8(backup_filename).c_str());
+        std::error_code ec;
+        if (std::filesystem::is_regular_file(primary_path, ec)) {
+            ec.clear();
+            std::filesystem::copy_file(
+                primary_path, backup_file_path, std::filesystem::copy_options::overwrite_existing, ec);
+            if (ec) {
+                std::filesystem::remove(temp_path, ec);
+                throw std::runtime_error("Could not create storage backup.");
+            }
         }
 
-        // Rename temp to original
-        if (std::rename(WStringToUTF8(temp_filename).c_str(), WStringToUTF8(filename_).c_str()) != 0) {
-            throw std::runtime_error("Could not rename temp file to original path.");
+        ec.clear();
+        std::filesystem::rename(temp_path, primary_path, ec);
+        if (ec) {
+            std::error_code cleanup_ec;
+            std::filesystem::remove(temp_path, cleanup_ec);
+            throw std::runtime_error("Could not atomically replace storage file: " + ec.message());
         }
 #endif
+        loaded_stamp_ = getFileStamp(filename_);
+        saved_generation_ = generation;
+        state_error_ = VinaStorageError::none;
         std::wcout << L"VinaStorage saved to '" << filename_ << L"'." << std::endl;
     }
 
@@ -722,6 +1135,7 @@ public:
         std::wstring current_key_;
         // 只有当 is_root_proxy 为 true 时，map_ptr_ 才直接指向 root_objects_ 中的一个元素
         bool is_root_proxy;
+        VinaStorage* owner_;
 
     public:
         // 迭代器返回 pair<const std::wstring, VinaStorageValue&>
@@ -789,6 +1203,7 @@ public:
 
         // 用于范围 for 循环的 begin 方法 (新增)
         Iterator begin() {
+            if (owner_) owner_->markMutationTrackingUncertain();
             // 尝试获取当前 Proxy 所代表的 map
             VinaStorageObjectMap* target_map = nullptr;
             if (is_root_proxy) {
@@ -834,17 +1249,17 @@ public:
         }
 
 
-        Proxy(VinaStorageObjectMap* map, const std::wstring& key, bool is_root = true)
-            : map_ptr_(map), current_key_(key), is_root_proxy(is_root) {
+        Proxy(VinaStorageObjectMap* map, const std::wstring& key, bool is_root, VinaStorage* owner)
+            : map_ptr_(map), current_key_(key), is_root_proxy(is_root), owner_(owner) {
         }
 
-        Proxy(VinaStorageObjectMap* map, const std::wstring& key)
-            : map_ptr_(map), current_key_(key), is_root_proxy(false) {
+        Proxy(VinaStorageObjectMap* map, const std::wstring& key, VinaStorage* owner)
+            : map_ptr_(map), current_key_(key), is_root_proxy(false), owner_(owner) {
         }
 
         Proxy operator[](const std::wstring& key) {
             if (is_root_proxy) {
-                return Proxy(map_ptr_, key, false);
+                return Proxy(map_ptr_, key, false, owner_);
             }
             else {
                 if (!map_ptr_) {
@@ -856,6 +1271,7 @@ public:
                 if (it == map_ptr_->end()) {
                     auto new_nested_obj_ptr = std::make_shared<VinaStorageNestedObject>();
                     (*map_ptr_)[current_key_] = new_nested_obj_ptr;
+                    if (owner_) owner_->markMutated();
                     it = map_ptr_->find(current_key_);
                 }
 
@@ -865,15 +1281,17 @@ public:
                         // 如果指针为空，创建一个新的
                         nested_obj_ptr = std::make_shared<VinaStorageNestedObject>();
                         (*map_ptr_)[current_key_] = nested_obj_ptr; // 更新 map_ptr_
+                        if (owner_) owner_->markMutated();
                     }
                     // 返回一个指向 nested_obj_ptr->data 的 Proxy
-                    return Proxy(&nested_obj_ptr->data, key, false);
+                    return Proxy(&nested_obj_ptr->data, key, false, owner_);
                 }
                 else {
                     auto new_nested_obj_ptr = std::make_shared<VinaStorageNestedObject>();
                     (*map_ptr_)[current_key_] = new_nested_obj_ptr;
+                    if (owner_) owner_->markMutated();
                     // 返回一个指向新嵌套对象->data 的 Proxy
-                    return Proxy(&new_nested_obj_ptr->data, key, false);
+                    return Proxy(&new_nested_obj_ptr->data, key, false, owner_);
                 }
             }
         }
@@ -932,11 +1350,16 @@ public:
                 std::is_same_v<DecayedT, std::wstring>) {
                 (*map_ptr_)[current_key_] = value;
             }
+            else if constexpr (std::is_same_v<DecayedT, float>) {
+                (*map_ptr_)[current_key_] = VinaStorage::normalizeFloat(value);
+            }
             else {
                 // 尝试将其他类型转换为 std::wstring 或抛出错误
                 // 由于不知道 T 的具体类型，这里只处理上面列出的，其他情况可能需要额外的 to_wstring 或 cast
                 std::wcerr << L"Warning: Unsupported type assignment for key '" << current_key_ << L"'. Skipping." << std::endl;
+                return;
             }
+            if (owner_) owner_->markMutated();
         }
 
         template<typename T>
@@ -954,57 +1377,44 @@ public:
             if (it == map_ptr_->end()) {
                 return default_value;
             }
-            try {
-                // 尝试从 VinaStorageValue 中直接获取 T
-                if constexpr (std::is_same_v<T, std::wstring>) {
-                    return std::get<T>(it->second);
-                }
-                else if constexpr (std::is_integral_v<T> && !std::is_same_v<T, bool>) {
-                    // 如果请求的是整数类型，尝试 int，如果失败则尝试 double
-                    try {
-                        return (T)std::get<int>(it->second);
+            if constexpr (std::is_same_v<T, std::wstring> || std::is_same_v<T, bool> ||
+                std::is_same_v<T, std::shared_ptr<VinaStorageNestedObject>>) {
+                if (const auto* value = std::get_if<T>(&it->second)) {
+                    if constexpr (std::is_same_v<T, std::shared_ptr<VinaStorageNestedObject>>) {
+                        if (owner_) owner_->markMutationTrackingUncertain();
                     }
-                    catch (const std::exception&) {
-                        try {
-                            // 允许从 double 隐式转换
-                            return (T)std::get<double>(it->second);
-                        }
-                        catch (const std::exception&) {
-                            // 进一步：尝试从 string 转换 (可选)
-                            return default_value;
-                        }
-                    }
+                    return *value;
                 }
-                else if constexpr (std::is_floating_point_v<T>) {
-                    // 如果请求的是浮点数，尝试 double，如果失败则尝试 int
-                    try {
-                        return (T)std::get<double>(it->second);
-                    }
-                    catch (const std::exception&) {
-                        try {
-                            // 允许从 int 隐式转换
-                            return (T)std::get<int>(it->second);
-                        }
-                        catch (const std::exception&) {
-                            return default_value;
-                        }
-                    }
-                }
-                else if constexpr (std::is_same_v<T, bool>) {
-                    return std::get<T>(it->second);
-                }
-                else if constexpr (std::is_same_v<T, std::shared_ptr<VinaStorageNestedObject>>) {
-                    return std::get<T>(it->second);
-                }
-                else {
-                    // 默认的 std::get 行为
-                    return std::get<T>(it->second);
-                }
-            }
-            catch (const std::exception&) {
                 return default_value;
             }
-            catch (...) {
+            else if constexpr (std::is_integral_v<T>) {
+                long double number = 0;
+                if (const auto* value = std::get_if<int>(&it->second)) number = *value;
+                else if (const auto* value = std::get_if<double>(&it->second)) {
+                    if (!std::isfinite(*value)) return default_value;
+                    number = *value;
+                }
+                else return default_value;
+                if (number < static_cast<long double>(std::numeric_limits<T>::lowest()) ||
+                    number > static_cast<long double>(std::numeric_limits<T>::max())) {
+                    return default_value;
+                }
+                return static_cast<T>(number);
+            }
+            else if constexpr (std::is_floating_point_v<T>) {
+                long double number = 0;
+                if (const auto* value = std::get_if<double>(&it->second)) number = *value;
+                else if (const auto* value = std::get_if<int>(&it->second)) number = *value;
+                else return default_value;
+                if (!std::isfinite(number) ||
+                    number < -static_cast<long double>(std::numeric_limits<T>::max()) ||
+                    number > static_cast<long double>(std::numeric_limits<T>::max())) {
+                    return default_value;
+                }
+                return static_cast<T>(number);
+            }
+            else {
+                if (const auto* value = std::get_if<T>(&it->second)) return *value;
                 return default_value;
             }
         }
@@ -1018,11 +1428,13 @@ public:
                 return false;
             }
             size_t count = map_ptr_->erase(current_key_);
+            if (count > 0 && owner_) owner_->markMutated();
             return count > 0;
         }
 
         const VinaStorageObjectMap* GetMapPtr() const {
             if (is_root_proxy) {
+                if (owner_) owner_->markMutationTrackingUncertain();
                 return map_ptr_;
             }
             return nullptr;
@@ -1034,16 +1446,19 @@ public:
         if (it == root_objects_.end()) {
             // 如果不存在，插入一个空的根对象 Map
             root_objects_[root_obj_name] = VinaStorageObjectMap{};
+            markMutated();
             it = root_objects_.find(root_obj_name);
         }
         // Proxy(MapPtr, Key, is_root)
         // 对于根代理，map_ptr_ 指向根对象 map，current_key_ 是空字符串，is_root_proxy 为 true
-        return Proxy(const_cast<VinaStorageObjectMap*>(&it->second), std::wstring(L""), true);
+        return Proxy(const_cast<VinaStorageObjectMap*>(&it->second), std::wstring(L""), true, this);
     }
 
     // 专门移除根对象的方法（Proxy::remove() 不允许移除根对象）
     bool RemoveRootObject(const std::wstring& root_obj_name) {
-        return root_objects_.erase(root_obj_name) > 0;
+        const bool removed = root_objects_.erase(root_obj_name) > 0;
+        if (removed) markMutated();
+        return removed;
     }
 
     template<typename T>
@@ -1054,12 +1469,22 @@ public:
         auto root_it = root_objects_.find(root_obj_name);
         if (root_it != root_objects_.end()) {
             auto& root_map = root_it->second;
-            return Proxy(const_cast<VinaStorageObjectMap*>(&root_map), key, false).template get<T>(default_value);
+            return Proxy(const_cast<VinaStorageObjectMap*>(&root_map), key, false, this).template get<T>(default_value);
         }
         return default_value;
     }
 
+    bool HasNestedObject(const std::wstring& root_obj_name, const std::wstring& key) const {
+        const auto root_it = root_objects_.find(root_obj_name);
+        if (root_it == root_objects_.end()) return false;
+        const auto value_it = root_it->second.find(key);
+        if (value_it == root_it->second.end()) return false;
+        const auto* nested = std::get_if<std::shared_ptr<VinaStorageNestedObject>>(&value_it->second);
+        return nested && static_cast<bool>(*nested);
+    }
+
     const VinaStorageObjectMap& GetRootObjectMap(const std::wstring& root_obj_name) const {
+        markMutationTrackingUncertain();
         auto it = root_objects_.find(root_obj_name);
         if (it == root_objects_.end()) {
             static const VinaStorageObjectMap empty_map;
