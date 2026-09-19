@@ -9,6 +9,19 @@
 
 namespace PoggetMeta {
 
+    static const wchar_t* MetaOperationName(MetaOpType operation) noexcept {
+        switch (operation) {
+        case MetaOpType::Copy: return L"Copy";
+        case MetaOpType::Move: return L"Move";
+        case MetaOpType::Rename: return L"Rename";
+        case MetaOpType::Delete: return L"Delete";
+        case MetaOpType::Recycle: return L"Recycle";
+        case MetaOpType::PrivateDelete: return L"PrivateDelete";
+        case MetaOpType::RecycleWithUndoBackup: return L"RecycleWithUndoBackup";
+        }
+        return L"Unknown";
+    }
+
     static bool RestoreReplacedDestinationWithoutDataLoss(
         AsyncFileTask& task,
         IPoggetMetaListener* listener) {
@@ -111,16 +124,16 @@ namespace PoggetMeta {
     }
 #endif
 
-    void PoggetMetaManager::PerformAsyncCopy(
-        const std::vector<AsyncFileTask>& pasteQueue,
+    void PoggetMetaManager::SubmitTransferBatch(
+        const std::vector<AsyncFileTask>& transferQueue,
         int batchCollisionChoice,
         bool verifyContent) {
         std::vector<AsyncFileTask> adjustedBatch;
-        for (auto t : pasteQueue) {
+        adjustedBatch.reserve(transferQueue.size());
+        for (auto t : transferQueue) {
             t.batchCollisionChoice = batchCollisionChoice;
             t.verifyContent = verifyContent;
-            t.opType = t.isMenuPaste ? MetaOpType::Move : MetaOpType::Copy;
-            adjustedBatch.push_back(t);
+            adjustedBatch.push_back(std::move(t));
         }
         SubmitTaskBatch(adjustedBatch);
     }
@@ -136,12 +149,8 @@ namespace PoggetMeta {
         std::vector<PoggetCore::HistoryFileSystem::DestructiveRequest> destructiveRequests;
 
         for (const auto& task : prepared) {
-            const bool isTransfer = task.opType == MetaOpType::Copy ||
-                task.opType == MetaOpType::Move || task.opType == MetaOpType::Rename ||
-                task.opType == MetaOpType::RecycleWithUndoBackup;
-            const bool isDestructive = task.opType == MetaOpType::Delete ||
-                task.opType == MetaOpType::Recycle ||
-                task.opType == MetaOpType::RecycleWithUndoBackup;
+            const bool isTransfer = OperationRequiresDestination(task.opType);
+            const bool isDestructive = IsDestructiveOperation(task.opType);
             if (isDestructive) {
                 destructiveRequests.push_back({ task.src, task.requiredSourceParent });
             }
@@ -187,9 +196,7 @@ namespace PoggetMeta {
 
         if (batchFailure.empty()) {
             for (const auto& task : prepared) {
-                const bool isTransfer = task.opType == MetaOpType::Copy ||
-                    task.opType == MetaOpType::Move || task.opType == MetaOpType::Rename ||
-                    task.opType == MetaOpType::RecycleWithUndoBackup;
+                const bool isTransfer = OperationRequiresDestination(task.opType);
                 if (!isTransfer) continue;
                 const auto sourceKey = PoggetCore::HistoryFileSystem::ComparablePath(task.src);
                 const auto destinationKey = PoggetCore::HistoryFileSystem::ComparablePath(task.dest);
@@ -209,7 +216,7 @@ namespace PoggetMeta {
             std::lock_guard<std::mutex> lock(m_queueMutex);
             for (auto t : prepared) {
                 t.batchId = newBatchId;
-                if (!t.listener) t.listener = m_listener.load();
+                if (!t.listener && t.notifyListener) t.listener = m_listener.load();
                 m_taskQueue.push(t);
             }
         }
@@ -296,9 +303,7 @@ namespace PoggetMeta {
                         task.failureReason = L"operation was cancelled";
                     }
                     else {
-                        const bool isDestructive = task.opType == MetaOpType::Delete ||
-                            task.opType == MetaOpType::Recycle ||
-                            task.opType == MetaOpType::RecycleWithUndoBackup;
+                        const bool isDestructive = IsDestructiveOperation(task.opType);
                         if (isDestructive) {
                             const auto validation =
                                 PoggetCore::HistoryFileSystem::ValidateDestructiveBatch(
@@ -332,6 +337,11 @@ namespace PoggetMeta {
                         }
 
                         if (task.failureReason.empty()) {
+                            PoggetLogger::Log(L"PoggetMeta", L"INFO",
+                                L"Executing async file task: operation=" +
+                                std::wstring(MetaOperationName(task.opType)) +
+                                L" source=\"" + task.src + L"\" destination=\"" +
+                                task.dest + L"\"");
                             if (task.opType == MetaOpType::Move) {
                                 acceptResult(PoggetCore::HistoryFileSystem::MovePath(
                                     task.src, task.dest, task.verifyContent));
@@ -350,6 +360,10 @@ namespace PoggetMeta {
                             }
                             else if (task.opType == MetaOpType::Recycle) {
                                 acceptResult(PoggetCore::HistoryFileSystem::RecyclePath(task.src));
+                            }
+                            else if (task.opType == MetaOpType::PrivateDelete) {
+                                acceptResult(PoggetCore::HistoryFileSystem::MovePath(
+                                    task.src, task.dest, task.verifyContent));
                             }
                             else if (task.opType == MetaOpType::RecycleWithUndoBackup) {
                                 acceptResult(

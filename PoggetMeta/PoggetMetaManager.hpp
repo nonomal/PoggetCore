@@ -46,9 +46,8 @@ namespace PoggetMeta {
         unsigned long GetLastTick() const { return m_lastTick; }
         void SetLastTick(unsigned long tick) { m_lastTick = tick; }
 
-        // Legacy compatibility
-        void PerformAsyncCopy(
-            const std::vector<AsyncFileTask>& pasteQueue,
+        void SubmitTransferBatch(
+            const std::vector<AsyncFileTask>& transferQueue,
             int batchCollisionChoice,
             bool verifyContent = false);
         

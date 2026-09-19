@@ -90,6 +90,8 @@ namespace PoggetCore {
         proxy[L"shadowOffsetY"] = model.shadowOffsetY;
         proxy[L"EnableInlineFolderView"] = model.EnableInlineFolderView;
         proxy[L"textSize"] = model.textSize;
+        proxy[L"TextOmitOffset"] = model.TextOmitOffset;
+        proxy[L"AllowTextWrapOverflow"] = model.AllowTextWrapOverflow;
     }
 
     bool PoggetStorageProvider::LoadContainerModel(const std::wstring& containerId, ContainerModel& outModel) {
@@ -152,6 +154,8 @@ namespace PoggetCore {
         outModel.shadowOffsetY = static_cast<float>(proxy[L"shadowOffsetY"].get<double>(4.0));
         outModel.EnableInlineFolderView = proxy[L"EnableInlineFolderView"].get<bool>(true);
         outModel.textSize = static_cast<float>(proxy[L"textSize"].get<double>(10.0));
+        outModel.TextOmitOffset = std::clamp(proxy[L"TextOmitOffset"].get<int>(0), -6, 6);
+        outModel.AllowTextWrapOverflow = proxy[L"AllowTextWrapOverflow"].get<bool>(false);
         return true;
     }
 

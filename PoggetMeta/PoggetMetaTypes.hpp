@@ -13,8 +13,35 @@ namespace PoggetMeta {
         Rename,
         Delete,
         Recycle,
+        PrivateDelete,
         RecycleWithUndoBackup
     };
+
+    enum class DeleteDisposition {
+        RecycleBin,
+        Permanent
+    };
+
+    inline constexpr MetaOpType ResolveDeleteOperation(
+        DeleteDisposition disposition,
+        bool recordUndo) noexcept {
+        if (disposition == DeleteDisposition::RecycleBin) {
+            return recordUndo ? MetaOpType::RecycleWithUndoBackup : MetaOpType::Recycle;
+        }
+        return recordUndo ? MetaOpType::PrivateDelete : MetaOpType::Delete;
+    }
+
+    inline constexpr bool OperationRequiresDestination(MetaOpType operation) noexcept {
+        return operation == MetaOpType::Copy || operation == MetaOpType::Move ||
+            operation == MetaOpType::Rename || operation == MetaOpType::PrivateDelete ||
+            operation == MetaOpType::RecycleWithUndoBackup;
+    }
+
+    inline constexpr bool IsDestructiveOperation(MetaOpType operation) noexcept {
+        return operation == MetaOpType::Delete || operation == MetaOpType::Recycle ||
+            operation == MetaOpType::PrivateDelete ||
+            operation == MetaOpType::RecycleWithUndoBackup;
+    }
 
     struct AsyncFileTask {
         MetaOpType opType = MetaOpType::Copy;
@@ -25,7 +52,6 @@ namespace PoggetMeta {
         float scaledX = 0;
         float scaledY = 0;
         void* targetWin = nullptr;
-        bool isMenuPaste = false; // Legacy fallback
         int batchCollisionChoice = 0;
         uint64_t batchId = 0;
         std::wstring historyBackupRoot;

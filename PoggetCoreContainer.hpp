@@ -47,6 +47,8 @@ namespace PoggetCore {
         bool IsMergedHost = false;
         std::wstring MergedHostColor;
         std::wstring MergedHostId;
+        int MergedHostLayoutMode = 0; // 0: vertical sections, 1: top tabs
+        std::wstring MergedHostActiveMemberId;
         bool UseTargetFolder = false;
         std::wstring TargetFolder = L"vui!NULL";
         bool IsCustomTarget = false;
@@ -81,6 +83,8 @@ namespace PoggetCore {
         int ListDetailType = 0;
         std::wstring fontFamily = L"Segoe UI";
         float textSize = 10.0f;
+        int TextOmitOffset = 0;
+        bool AllowTextWrapOverflow = false;
         bool DisableLayoutAnimations = false;
 
         // 模式与状态标志
@@ -162,11 +166,11 @@ namespace PoggetCore {
         }
 
         static void DisposeHistoryPayload(const CoreFileOp& op) {
-            if ((op.type == 0 || op.type == 1) &&
-                HistoryFileSystem::IsManagedHistoryPath(op.path2)) {
+            if ((op.type == 0 || op.type == 1 || op.type == 9) &&
+                HistoryFileSystem::IsManagedHistoryPayloadPath(op.path2)) {
                 HistoryFileSystem::RemovePath(op.path2);
             }
-            if (HistoryFileSystem::IsManagedHistoryPath(op.path3)) {
+            if (HistoryFileSystem::IsManagedHistoryPayloadPath(op.path3)) {
                 HistoryFileSystem::RemovePath(op.path3);
             }
             for (const auto& subOp : op.subOps) DisposeHistoryPayload(subOp);

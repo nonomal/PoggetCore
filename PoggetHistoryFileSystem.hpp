@@ -25,6 +25,9 @@ namespace PoggetCore::HistoryFileSystem {
     inline constexpr std::uintmax_t FullContentVerificationLimit = 64ULL * 1024ULL * 1024ULL;
     inline constexpr std::uintmax_t SampleVerificationBlockSize = 1ULL * 1024ULL * 1024ULL;
     inline constexpr size_t SampleVerificationBlockCount = 8;
+    inline constexpr size_t DeleteUndoPromptItemThreshold = 128;
+    inline constexpr std::uintmax_t DeleteUndoPromptByteThreshold =
+        1ULL * 1024ULL * 1024ULL * 1024ULL;
     inline constexpr wchar_t OperationStorageDirectoryName[] = L".pogget_operations";
     inline constexpr wchar_t LegacyUndoStorageDirectoryName[] = L".pogget_undo";
 
@@ -60,6 +63,21 @@ namespace PoggetCore::HistoryFileSystem {
         std::error_code error;
     };
 
+    struct DeleteUndoRiskPolicy {
+        size_t itemCountThreshold = DeleteUndoPromptItemThreshold;
+        std::uintmax_t knownBytesThreshold = DeleteUndoPromptByteThreshold;
+    };
+
+    struct DeleteUndoRiskAssessment {
+        bool promptRecommended = false;
+        bool itemCountThresholdReached = false;
+        bool containsDirectory = false;
+        bool metadataUnavailable = false;
+        size_t itemCount = 0;
+        size_t inspectedItemCount = 0;
+        std::uintmax_t knownBytes = 0;
+    };
+
     struct RestoreRequest {
         std::filesystem::path source;
         std::filesystem::path preferredDestination;
@@ -80,6 +98,11 @@ namespace PoggetCore::HistoryFileSystem {
         std::vector<RestoreItemResult> items;
 
         explicit operator bool() const noexcept { return success; }
+    };
+
+    enum class RestoreFailurePolicy {
+        RollBackCommittedItems,
+        KeepCommittedItems
     };
 
     inline Result AuditedResult(
@@ -168,6 +191,62 @@ namespace PoggetCore::HistoryFileSystem {
 
     inline bool Exists(const std::filesystem::path& path) noexcept {
         return InspectPath(path).presence == PathPresence::Present;
+    }
+
+    /*
+     * Deletion prompts must never recursively enumerate a directory on the UI
+     * thread. Large batches are classified by count alone. Small batches only
+     * inspect top-level metadata and stop as soon as a warning condition is met.
+     */
+    inline DeleteUndoRiskAssessment AssessDeleteUndoRisk(
+        const std::vector<std::filesystem::path>& paths,
+        const DeleteUndoRiskPolicy& policy = {}) noexcept {
+        DeleteUndoRiskAssessment assessment;
+        assessment.itemCount = paths.size();
+        if (policy.itemCountThreshold > 0 &&
+            paths.size() >= policy.itemCountThreshold) {
+            assessment.promptRecommended = true;
+            assessment.itemCountThresholdReached = true;
+            return assessment;
+        }
+
+        for (const auto& path : paths) {
+            ++assessment.inspectedItemCount;
+            const auto inspection = InspectPath(path);
+            if (inspection.presence != PathPresence::Present) {
+                assessment.promptRecommended = true;
+                assessment.metadataUnavailable = true;
+                return assessment;
+            }
+            if (std::filesystem::is_directory(inspection.status)) {
+                assessment.promptRecommended = true;
+                assessment.containsDirectory = true;
+                return assessment;
+            }
+            if (!std::filesystem::is_regular_file(inspection.status)) {
+                assessment.promptRecommended = true;
+                assessment.metadataUnavailable = true;
+                return assessment;
+            }
+
+            std::error_code sizeError;
+            const auto size = std::filesystem::file_size(
+                FileSystemAccessPath(path), sizeError);
+            if (sizeError) {
+                assessment.promptRecommended = true;
+                assessment.metadataUnavailable = true;
+                return assessment;
+            }
+            if (policy.knownBytesThreshold > 0 &&
+                (size >= policy.knownBytesThreshold ||
+                    assessment.knownBytes >= policy.knownBytesThreshold - size)) {
+                assessment.knownBytes = policy.knownBytesThreshold;
+                assessment.promptRecommended = true;
+                return assessment;
+            }
+            assessment.knownBytes += size;
+        }
+        return assessment;
     }
 
     inline Result EnsureDirectoryExists(const std::filesystem::path& path) noexcept {
@@ -310,6 +389,31 @@ namespace PoggetCore::HistoryFileSystem {
                 components[index - 1] == L".temp" &&
                 components[index - 2] == L".data") {
                 return true;
+            }
+        }
+        return false;
+    }
+
+    inline bool IsManagedHistoryPayloadPath(const std::filesystem::path& path) {
+        if (path.empty()) return false;
+        std::vector<std::wstring> components;
+        for (const auto& component : path.lexically_normal()) {
+            auto value = component.wstring();
+#ifdef _WIN32
+            std::transform(value.begin(), value.end(), value.begin(), ::towlower);
+#endif
+            components.push_back(std::move(value));
+        }
+
+        for (size_t index = 0; index < components.size(); ++index) {
+            const bool namedRoot = IsHistoryStorageRootName(components[index]) ||
+                components[index] == L"poggetundo";
+            const bool fallbackRoot = index >= 2 &&
+                (components[index] == L"operations" || components[index] == L"undo") &&
+                components[index - 1] == L".temp" &&
+                components[index - 2] == L".data";
+            if ((namedRoot || fallbackRoot) && index + 2 < components.size()) {
+                return true; // storage root / process session / payload
             }
         }
         return false;
@@ -643,6 +747,173 @@ namespace PoggetCore::HistoryFileSystem {
 #endif
     }
 
+    inline bool IsCrossVolumeMoveError(const std::error_code& error) noexcept {
+        if (!error) return false;
+#ifdef _WIN32
+        if (error.category() == std::system_category() &&
+            error.value() == ERROR_NOT_SAME_DEVICE) return true;
+#endif
+        return error == std::errc::cross_device_link;
+    }
+
+    inline bool IsTransientRenameError(const std::error_code& error) noexcept {
+#ifdef _WIN32
+        if (error.category() != std::system_category()) return false;
+        switch (error.value()) {
+        case ERROR_ACCESS_DENIED:
+        case ERROR_SHARING_VIOLATION:
+        case ERROR_LOCK_VIOLATION:
+        case ERROR_BUSY:
+        case ERROR_USER_MAPPED_FILE:
+            return true;
+        default:
+            return false;
+        }
+#else
+        return error == std::errc::device_or_resource_busy ||
+            error == std::errc::resource_unavailable_try_again;
+#endif
+    }
+
+    enum class VolumeRelation {
+        Unknown,
+        Same,
+        Different
+    };
+
+#ifdef _WIN32
+    struct PathVolumeIdentity {
+        bool available = false;
+        ULONGLONG serialNumber = 0;
+        std::error_code error;
+    };
+
+    inline PathVolumeIdentity QueryPathVolumeIdentity(
+        const std::filesystem::path& existingPath) noexcept {
+        const auto accessPath = FileSystemAccessPath(existingPath).wstring();
+        HANDLE handle = ::CreateFileW(
+            accessPath.c_str(), FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+        if (handle == INVALID_HANDLE_VALUE) {
+            return { false, 0,
+                std::error_code(static_cast<int>(::GetLastError()),
+                    std::system_category()) };
+        }
+
+        FILE_ID_INFO information{};
+        const BOOL succeeded = ::GetFileInformationByHandleEx(
+            handle, FileIdInfo, &information, sizeof(information));
+        const DWORD error = succeeded ? ERROR_SUCCESS : ::GetLastError();
+        ::CloseHandle(handle);
+        if (!succeeded) {
+            return { false, 0,
+                std::error_code(static_cast<int>(error), std::system_category()) };
+        }
+        return { true, information.VolumeSerialNumber, {} };
+    }
+
+    inline std::filesystem::path ResolveExistingParent(
+        const std::filesystem::path& path) noexcept {
+        auto parent = path.parent_path();
+        if (!parent.empty()) return parent;
+        std::error_code error;
+        parent = std::filesystem::current_path(error);
+        return error ? std::filesystem::path{} : parent;
+    }
+
+    inline VolumeRelation ComparePathVolumes(
+        const std::filesystem::path& source,
+        const std::filesystem::path& destination,
+        ULONGLONG* sourceSerial = nullptr,
+        ULONGLONG* destinationSerial = nullptr) noexcept {
+        const auto sourceIdentity = QueryPathVolumeIdentity(
+            ResolveExistingParent(source));
+        const auto destinationIdentity = QueryPathVolumeIdentity(
+            ResolveExistingParent(destination));
+        if (!sourceIdentity.available || !destinationIdentity.available) {
+            return VolumeRelation::Unknown;
+        }
+        if (sourceSerial) *sourceSerial = sourceIdentity.serialNumber;
+        if (destinationSerial) *destinationSerial = destinationIdentity.serialNumber;
+        return sourceIdentity.serialNumber == destinationIdentity.serialNumber
+            ? VolumeRelation::Same : VolumeRelation::Different;
+    }
+
+    inline std::error_code RenamePathByHandle(
+        const std::filesystem::path& source,
+        const std::filesystem::path& destination) noexcept {
+        const auto sourceAccess = FileSystemAccessPath(source).wstring();
+        const auto destinationParent = ResolveExistingParent(destination);
+        const auto destinationAccess = FileSystemAccessPath(destination).wstring();
+        if (destinationParent.empty() || destination.filename().empty()) {
+            return std::make_error_code(std::errc::invalid_argument);
+        }
+
+        HANDLE sourceHandle = ::CreateFileW(
+            sourceAccess.c_str(), DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+        if (sourceHandle == INVALID_HANDLE_VALUE) {
+            return std::error_code(static_cast<int>(::GetLastError()),
+                std::system_category());
+        }
+
+        const size_t fileNameBytes = destinationAccess.size() * sizeof(wchar_t);
+        const size_t bufferSize = offsetof(FILE_RENAME_INFO, FileName) + fileNameBytes;
+        if (bufferSize > static_cast<size_t>((std::numeric_limits<DWORD>::max)())) {
+            ::CloseHandle(sourceHandle);
+            return std::make_error_code(std::errc::filename_too_long);
+        }
+        std::vector<unsigned char> buffer(bufferSize, 0);
+        auto* information = reinterpret_cast<FILE_RENAME_INFO*>(buffer.data());
+        information->ReplaceIfExists = FALSE;
+        information->RootDirectory = nullptr;
+        information->FileNameLength = static_cast<DWORD>(fileNameBytes);
+        std::copy(destinationAccess.begin(), destinationAccess.end(), information->FileName);
+
+        const BOOL succeeded = ::SetFileInformationByHandle(
+            sourceHandle, FileRenameInfo, information,
+            static_cast<DWORD>(buffer.size()));
+        const DWORD error = succeeded ? ERROR_SUCCESS : ::GetLastError();
+        ::CloseHandle(sourceHandle);
+        return succeeded ? std::error_code{} :
+            std::error_code(static_cast<int>(error), std::system_category());
+    }
+#else
+    inline VolumeRelation ComparePathVolumes(
+        const std::filesystem::path&,
+        const std::filesystem::path&) noexcept {
+        return VolumeRelation::Unknown;
+    }
+#endif
+
+    inline std::error_code RenamePathWithoutCopy(
+        const std::filesystem::path& source,
+        const std::filesystem::path& destination) noexcept {
+        constexpr unsigned int maxAttempts = 4;
+        std::error_code error;
+        for (unsigned int attempt = 0; attempt < maxAttempts; ++attempt) {
+#ifdef _WIN32
+            const auto sourceAccess = FileSystemAccessPath(source).wstring();
+            const auto destinationAccess = FileSystemAccessPath(destination).wstring();
+            if (::MoveFileExW(sourceAccess.c_str(), destinationAccess.c_str(), 0)) {
+                return {};
+            }
+            error = std::error_code(static_cast<int>(::GetLastError()),
+                std::system_category());
+#else
+            std::filesystem::rename(
+                FileSystemAccessPath(source), FileSystemAccessPath(destination), error);
+            if (!error) return {};
+#endif
+            if (!IsTransientRenameError(error) || attempt + 1 >= maxAttempts) break;
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(25U * (attempt + 1U)));
+        }
+        return error;
+    }
+
     inline Result CopyToStaging(
         const std::filesystem::path& source,
         const std::filesystem::path& destination,
@@ -749,9 +1020,7 @@ namespace PoggetCore::HistoryFileSystem {
                 std::move(stagingResult));
         }
 
-        std::error_code ec;
-        std::filesystem::rename(FileSystemAccessPath(staging),
-            FileSystemAccessPath(destination), ec);
+        const auto ec = RenamePathWithoutCopy(staging, destination);
         if (ec) {
             RemovePath(staging);
             return AuditedResult(FileOperationType::Copy, source, destination,
@@ -871,13 +1140,59 @@ namespace PoggetCore::HistoryFileSystem {
             }
         }
 
-        std::error_code ec;
-        std::filesystem::rename(FileSystemAccessPath(source),
-            FileSystemAccessPath(destination), ec);
+#ifdef _WIN32
+        ULONGLONG sourceVolume = 0;
+        ULONGLONG destinationVolume = 0;
+        const auto volumeRelation = ComparePathVolumes(
+            source, destination, &sourceVolume, &destinationVolume);
+#else
+        const auto volumeRelation = ComparePathVolumes(source, destination);
+#endif
+        std::error_code ec = RenamePathWithoutCopy(source, destination);
         if (!ec) {
             return AuditedResult(operation, source, destination,
                 { true, {}, L"" });
         }
+
+#ifdef _WIN32
+        if (volumeRelation == VolumeRelation::Same) {
+            const auto pathRenameError = ec;
+            ec = RenamePathByHandle(source, destination);
+            if (!ec) {
+                PoggetLogger::Log(L"FileOperation", L"WARNING",
+                    L"Path rename failed but same-volume handle rename succeeded: source=\"" +
+                    source.wstring() + L"\" destination=\"" + destination.wstring() +
+                    L"\" pathError=" + std::to_wstring(pathRenameError.value()) +
+                    L" volume=" + std::to_wstring(sourceVolume));
+                return AuditedResult(operation, source, destination,
+                    { true, {},
+                        L"same-volume handle rename used after path rename failure" });
+            }
+            PoggetLogger::Log(L"FileOperation", L"ERROR",
+                L"Same-volume rename failed without copying: source=\"" +
+                source.wstring() + L"\" destination=\"" + destination.wstring() +
+                L"\" pathError=" + std::to_wstring(pathRenameError.value()) +
+                L" handleError=" + std::to_wstring(ec.value()) +
+                L" volume=" + std::to_wstring(sourceVolume));
+        }
+#endif
+
+        if (volumeRelation == VolumeRelation::Same || !IsCrossVolumeMoveError(ec)) {
+            return AuditedResult(operation, source, destination,
+                { false, ec,
+                    L"renaming path without copying; full-copy fallback is reserved "
+                    L"for cross-volume moves" });
+        }
+
+#ifdef _WIN32
+        PoggetLogger::Log(L"FileOperation", L"INFO",
+            L"Cross-volume staging move selected: source=\"" + source.wstring() +
+            L"\" destination=\"" + destination.wstring() +
+            L"\" sourceVolume=" + std::to_wstring(sourceVolume) +
+            L" destinationVolume=" + std::to_wstring(destinationVolume) +
+            L" relation=" + std::to_wstring(static_cast<int>(volumeRelation)) +
+            L" renameError=" + std::to_wstring(ec.value()));
+#endif
 
         /*
         Cross-volume moves use a two-phase commit. The source is first copied
@@ -909,19 +1224,16 @@ namespace PoggetCore::HistoryFileSystem {
                 { false, {}, L"creating source holding path" });
         }
 
-        ec.clear();
-        std::filesystem::rename(source, sourceHolding, ec);
+        ec = RenamePathWithoutCopy(source, sourceHolding);
         if (ec) {
             RemovePath(staging);
             return AuditedResult(operation, source, destination,
                 { false, ec, L"moving source to holding path" });
         }
 
-        ec.clear();
-        std::filesystem::rename(staging, destination, ec);
+        ec = RenamePathWithoutCopy(staging, destination);
         if (ec) {
-            std::error_code restoreEc;
-            std::filesystem::rename(sourceHolding, source, restoreEc);
+            const auto restoreEc = RenamePathWithoutCopy(sourceHolding, source);
             RemovePath(staging);
             if (restoreEc) {
                 return AuditedResult(operation, source, destination,
@@ -934,8 +1246,7 @@ namespace PoggetCore::HistoryFileSystem {
 
         if (!EquivalentPathContents(sourceHolding, destination, verifyContent)) {
             auto destinationCleanup = RemovePath(destination);
-            std::error_code restoreEc;
-            std::filesystem::rename(sourceHolding, source, restoreEc);
+            const auto restoreEc = RenamePathWithoutCopy(sourceHolding, source);
             if (restoreEc) {
                 return AuditedResult(operation, source, destination,
                     { false, restoreEc,
@@ -1004,7 +1315,9 @@ namespace PoggetCore::HistoryFileSystem {
     inline RestoreBatchResult RestoreBatchUsing(
         const std::vector<RestoreRequest>& requests,
         bool verifyContent,
-        MoveOperation&& moveOperation) {
+        MoveOperation&& moveOperation,
+        RestoreFailurePolicy failurePolicy =
+            RestoreFailurePolicy::RollBackCommittedItems) {
         RestoreBatchResult batch;
         batch.items.reserve(requests.size());
         for (const auto& request : requests) {
@@ -1123,6 +1436,21 @@ namespace PoggetCore::HistoryFileSystem {
             batch.context = result.context.empty()
                 ? L"restore move failed"
                 : result.context;
+            if (failurePolicy == RestoreFailurePolicy::KeepCommittedItems) {
+                // Container restore is intentionally progressive. Reversing already
+                // completed user-visible moves creates a burst of forward/backward
+                // renames that resembles ransomware behaviour to endpoint protection.
+                // Keep committed destinations intact and leave every later source
+                // untouched so the caller can retry only the remaining items.
+                batch.fullyRolledBack = committed.empty();
+                for (std::size_t remaining = index + 1;
+                    remaining < requests.size(); ++remaining) {
+                    batch.items[remaining].result = {
+                        false, {}, L"restore batch stopped after an earlier failure"
+                    };
+                }
+                return batch;
+            }
             for (auto committedIt = committed.rbegin(); committedIt != committed.rend(); ++committedIt) {
                 const auto committedIndex = *committedIt;
                 auto rollback = moveOperation(
@@ -1177,6 +1505,20 @@ namespace PoggetCore::HistoryFileSystem {
                 bool verify) {
                 return MovePath(source, destination, verify);
             });
+    }
+
+    inline RestoreBatchResult RestoreBatchProgressively(
+        const std::vector<RestoreRequest>& requests,
+        bool verifyContent = false) {
+        return Detail::RestoreBatchUsing(
+            requests,
+            verifyContent,
+            [](const std::filesystem::path& source,
+                const std::filesystem::path& destination,
+                bool verify) {
+                return MovePath(source, destination, verify);
+            },
+            RestoreFailurePolicy::KeepCommittedItems);
     }
 
     inline Result BackupDestination(
